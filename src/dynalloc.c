@@ -359,7 +359,11 @@ int dynalloc_delete_dsn(const char *dsn)
 {
     char cmd[128];
     char msg[128];
-    snprintf(cmd, sizeof(cmd), "alloc da('%s') old delete", dsn);
+    snprintf(cmd, sizeof(cmd), "alloc fi(DELDD) da('%s') old delete", dsn);
     log_verbose("dynalloc: %s", cmd);
-    return dynalloc_str(cmd, msg, sizeof(msg));
+    int rc = dynalloc_str(cmd, msg, sizeof(msg));
+    if (rc == 0) {
+        dynalloc_str("free fi(DELDD)", msg, sizeof(msg));
+    }
+    return rc;
 }
