@@ -84,6 +84,8 @@ typedef int (*netdata_record_cb_t)(bool is_control, const uint8_t *data, size_t 
 
 /* Netdata Card / Stream Reader */
 typedef struct {
+    uint8_t             stream_buf[4096];
+    size_t              stream_len;
     uint8_t             assembly_buf[65536];
     size_t              assembly_len;
     bool                assembly_is_control;

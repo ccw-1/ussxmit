@@ -59,35 +59,16 @@ void netdata_writer_init(netdata_writer_t *w, FILE *out_fp)
     memset(w->card_buf, 0x40, sizeof(w->card_buf));
 }
 
-int netdata_writer_emit_record(netdata_writer_t *w, bool is_control, const uint8_t *data, size_t len)
+int netdata_writer_put_segment(netdata_writer_t *w, uint8_t flags, const uint8_t *data, size_t len)
 {
-    if (!w || !w->out_fp) return -1;
+    if (!w || !w->out_fp || len > 253) return -1;
 
-    if (len == 0) {
-        if (w->card_pos > 0 && w->card_pos + 2 > 80) {
-            if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
-            w->total_records_written++;
-            w->total_bytes_written += 80;
-            w->card_pos = 0;
-            memset(w->card_buf, 0x40, sizeof(w->card_buf));
-        }
-        w->card_buf[w->card_pos++] = 2;
-        w->card_buf[w->card_pos++] = is_control ? 0xE0 : 0xC0;
-        return 0;
-    }
+    uint8_t seg_hdr[2];
+    seg_hdr[0] = (uint8_t)(len + 2);
+    seg_hdr[1] = flags;
 
-    if (len <= 78) {
-        if (w->card_pos > 0 && w->card_pos + len + 2 > 80) {
-            if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
-            w->total_records_written++;
-            w->total_bytes_written += 80;
-            w->card_pos = 0;
-            memset(w->card_buf, 0x40, sizeof(w->card_buf));
-        }
-        w->card_buf[w->card_pos++] = (uint8_t)(len + 2);
-        w->card_buf[w->card_pos++] = is_control ? 0xE0 : 0xC0;
-        memcpy(w->card_buf + w->card_pos, data, len);
-        w->card_pos += len;
+    for (int h = 0; h < 2; h++) {
+        w->card_buf[w->card_pos++] = seg_hdr[h];
         if (w->card_pos == 80) {
             if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
             w->total_records_written++;
@@ -95,23 +76,37 @@ int netdata_writer_emit_record(netdata_writer_t *w, bool is_control, const uint8
             w->card_pos = 0;
             memset(w->card_buf, 0x40, sizeof(w->card_buf));
         }
-        return 0;
     }
 
-    /* Spanned logical record (len > 78) */
-    if (w->card_pos > 0) {
-        if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
-        w->total_records_written++;
-        w->total_bytes_written += 80;
-        w->card_pos = 0;
-        memset(w->card_buf, 0x40, sizeof(w->card_buf));
+    for (size_t i = 0; i < len; i++) {
+        w->card_buf[w->card_pos++] = data[i];
+        if (w->card_pos == 80) {
+            if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
+            w->total_records_written++;
+            w->total_bytes_written += 80;
+            w->card_pos = 0;
+            memset(w->card_buf, 0x40, sizeof(w->card_buf));
+        }
     }
 
+    return 0;
+}
+
+int netdata_writer_emit_record(netdata_writer_t *w, bool is_control, const uint8_t *data, size_t len)
+{
+    if (!w || !w->out_fp) return -1;
+
+    if (len <= 253) {
+        uint8_t flags = is_control ? 0xE0 : 0xC0;
+        return netdata_writer_put_segment(w, flags, data, len);
+    }
+
+    /* Spanned logical record (len > 253) */
     size_t offset = 0;
     bool first = true;
     while (offset < len) {
         size_t rem = len - offset;
-        size_t chunk = (rem > 78) ? 78 : rem;
+        size_t chunk = (rem > 253) ? 253 : rem;
         bool last = (offset + chunk >= len);
 
         uint8_t flags;
@@ -124,17 +119,9 @@ int netdata_writer_emit_record(netdata_writer_t *w, bool is_control, const uint8
             flags = is_control ? 0x20 : 0x00;
         }
 
-        w->card_buf[0] = (uint8_t)(chunk + 2);
-        w->card_buf[1] = flags;
-        memcpy(w->card_buf + 2, data + offset, chunk);
-        memset(w->card_buf + 2 + chunk, 0x40, 80 - (2 + chunk));
-
-        if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
-        w->total_records_written++;
-        w->total_bytes_written += 80;
-        w->card_pos = 0;
-        memset(w->card_buf, 0x40, sizeof(w->card_buf));
-
+        if (netdata_writer_put_segment(w, flags, data + offset, chunk) != 0) {
+            return -1;
+        }
         offset += chunk;
     }
 
@@ -471,22 +458,41 @@ void netdata_reader_init(netdata_reader_t *r, netdata_record_cb_t cb, void *user
     r->user_data = user_data;
 }
 
-int netdata_reader_feed_card(netdata_reader_t *r, const uint8_t card[80])
+int netdata_reader_feed(netdata_reader_t *r, const uint8_t *buf, size_t len)
 {
-    if (!r || !card) return -1;
-    r->total_cards_read++;
+    if (!r || !buf) return -1;
 
-    size_t pos = 0;
-    while (pos + 2 <= 80) {
-        uint8_t seg_len = card[pos];
-        uint8_t flags   = card[pos + 1];
+    size_t in_pos = 0;
 
-        if (seg_len < 2 || pos + seg_len > 80) {
-            /* Remainder is padding */
-            break;
+    while (in_pos < len || r->stream_len > 0) {
+        /* Fill stream buffer from input */
+        while (in_pos < len && r->stream_len < sizeof(r->stream_buf)) {
+            r->stream_buf[r->stream_len++] = buf[in_pos++];
         }
 
-        const uint8_t *seg_data = card + pos + 2;
+        if (r->stream_len < 2) {
+            break; /* Need more input */
+        }
+
+        uint8_t seg_len = r->stream_buf[0];
+        uint8_t flags   = r->stream_buf[1];
+
+        if (seg_len < 2) {
+            /* Skip padding byte (0x00 or 0x40) */
+            memmove(r->stream_buf, r->stream_buf + 1, r->stream_len - 1);
+            r->stream_len--;
+            continue;
+        }
+
+        if (r->stream_len < seg_len) {
+            if (in_pos >= len) {
+                /* Incomplete segment, wait for more data */
+                break;
+            }
+            continue;
+        }
+
+        const uint8_t *seg_data = r->stream_buf + 2;
         size_t seg_data_len = seg_len - 2;
 
         bool is_first = (flags & 0x80) != 0;
@@ -514,25 +520,17 @@ int netdata_reader_feed_card(netdata_reader_t *r, const uint8_t card[80])
             r->assembly_len = 0;
         }
 
-        pos += seg_len;
-        if (pos >= 80 || card[pos] == 0x00 || card[pos] == 0x40) {
-            break;
-        }
+        /* Consume segment from stream buffer */
+        memmove(r->stream_buf, r->stream_buf + seg_len, r->stream_len - seg_len);
+        r->stream_len -= seg_len;
     }
 
     return 0;
 }
 
-int netdata_reader_feed(netdata_reader_t *r, const uint8_t *buf, size_t len)
+int netdata_reader_feed_card(netdata_reader_t *r, const uint8_t card[80])
 {
-    if (!r || !buf) return -1;
-    size_t offset = 0;
-    while (offset + 80 <= len) {
-        int rc = netdata_reader_feed_card(r, buf + offset);
-        if (rc != 0) return rc;
-        offset += 80;
-    }
-    return 0;
+    return netdata_reader_feed(r, card, 80);
 }
 
 static int header_parse_cb(bool is_control, const uint8_t *data, size_t len, void *user_data)
