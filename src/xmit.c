@@ -30,13 +30,10 @@ int do_xmit(const ussxmit_opts_t *opts)
     log_verbose("Source dataset: %s", src_dsn);
     log_verbose("Staging dataset: %s", temp_dsn);
 
-    /* Allocate temporary staging sequential dataset */
-    if (dynalloc_alloc_temp_seq(temp_dsn, 20, 100) != 0) {
-        log_error("Failed to allocate staging dataset %s", temp_dsn);
-        return RC_ERR_ALLOC_TGT;
-    }
+    /* Ensure staging dataset name is clean / unallocated */
+    dynalloc_delete_dsn(temp_dsn);
 
-    /* Execute TSO TRANSMIT command */
+    /* Execute TSO TRANSMIT command (TSO XMIT allocates OUTDSNAME automatically) */
     char tso_cmd[256];
     snprintf(tso_cmd, sizeof(tso_cmd),
              "tsocmd \"XMIT (DUMMY.DUMMY) DATASET('%s') OUTDSNAME('%s') NOLOG\" > /dev/null 2>&1",

@@ -13,36 +13,6 @@
 #include "dataset_io.h"
 #include "utils.h"
 
-static int wait_for_job(const char *jobid, int timeout_secs)
-{
-    if (!jobid || !*jobid) return -1;
-    log_verbose("Waiting for batch job %s to complete...", jobid);
-
-    for (int t = 0; t < timeout_secs * 2; t++) {
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "tsocmd \"STATUS\" 2>&1");
-        FILE *p = popen(cmd, "r");
-        if (p) {
-            char line[256];
-            bool done = false;
-            while (fgets(line, sizeof(line), p)) {
-                if (strstr(line, jobid) && strstr(line, "OUTPUT QUEUE")) {
-                    done = true;
-                    break;
-                }
-            }
-            pclose(p);
-            if (done) {
-                log_verbose("Job %s completed", jobid);
-                return 0;
-            }
-        }
-        usleep(500000); /* 500ms */
-    }
-    log_error("Timeout waiting for job %s", jobid);
-    return -1;
-}
-
 int do_receive(const ussxmit_opts_t *opts)
 {
     if (!opts) return RC_ERR_SYNTAX;
@@ -126,8 +96,7 @@ int do_receive(const ussxmit_opts_t *opts)
     fflush(p);
     pclose(p);
 
-    /* Wait for completion via status check */
-    /* Give JES a moment and check if target dataset exists */
+    /* Give JES a moment and check */
     sleep(1);
 
     /* Clean up temporary staging dataset */
