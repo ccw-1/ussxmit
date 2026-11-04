@@ -54,13 +54,6 @@ int do_inspect(const ussxmit_opts_t *opts)
     }
 
     log_verbose("do_inspect: read %zu bytes from input source", nread);
-    if (nread >= 80) {
-        log_verbose("do_inspect: first 16 bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-                    (uint8_t)header_buf[0], (uint8_t)header_buf[1], (uint8_t)header_buf[2], (uint8_t)header_buf[3],
-                    (uint8_t)header_buf[4], (uint8_t)header_buf[5], (uint8_t)header_buf[6], (uint8_t)header_buf[7],
-                    (uint8_t)header_buf[8], (uint8_t)header_buf[9], (uint8_t)header_buf[10], (uint8_t)header_buf[11],
-                    (uint8_t)header_buf[12], (uint8_t)header_buf[13], (uint8_t)header_buf[14], (uint8_t)header_buf[15]);
-    }
 
     if (nread < 80) {
         log_error("Input source contains fewer than 80 bytes");
