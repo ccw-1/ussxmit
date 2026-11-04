@@ -19,7 +19,9 @@ static int wait_for_job(const char *jobid, int timeout_secs)
     log_verbose("Waiting for batch job %s to complete...", jobid);
 
     for (int t = 0; t < timeout_secs; t++) {
-        FILE *p = popen("tsocmd \"STATUS\" 2>&1", "r");
+        char status_cmd[128];
+        snprintf(status_cmd, sizeof(status_cmd), "tsocmd \"STATUS\" 2>&1");
+        FILE *p = popen(status_cmd, "r");
         if (p) {
             char buf[8192];
             size_t n = fread(buf, 1, sizeof(buf) - 1, p);
@@ -27,17 +29,8 @@ static int wait_for_job(const char *jobid, int timeout_secs)
             buf[n] = '\0';
             e2a_mem(buf, n);
 
-            char *pos = strstr(buf, jobid);
-            if (pos) {
-                /* Find the line or segment containing this job */
-                char *end = strchr(pos, '\n');
-                if (!end) end = pos + strlen(pos);
-                char line[256];
-                size_t llen = (size_t)(end - pos) < sizeof(line) - 1 ? (size_t)(end - pos) : sizeof(line) - 1;
-                memcpy(line, pos, llen);
-                line[llen] = '\0';
-
-                if (strstr(line, "OUTPUT QUEUE")) {
+            if (strstr(buf, jobid)) {
+                if (strstr(buf, "OUTPUT QUEUE") || strstr(buf, "output queue")) {
                     log_verbose("Job %s completed successfully", jobid);
                     return 0;
                 }
@@ -105,20 +98,25 @@ int do_receive(const ussxmit_opts_t *opts)
         dynalloc_delete_dsn(target_dsn);
     }
 
+    /* Format job name based on current user HLQ so STATUS finds it */
+    char jobname[16];
+    const char *hlq = get_current_hlq();
+    snprintf(jobname, sizeof(jobname), "%.7sR", hlq);
+
     /* Write temporary JCL file in EBCDIC */
     char jcl_path[128];
     snprintf(jcl_path, sizeof(jcl_path), "/tmp/rcv_%d_%lx.jcl", (int)getpid(), (unsigned long)time(NULL));
 
     char jcl[1024];
     snprintf(jcl, sizeof(jcl),
-             "//RCVJOB JOB (1),MSGCLASS=A,CLASS=A\n"
+             "//%s JOB (1),MSGCLASS=A,CLASS=A\n"
              "//STEP1 EXEC PGM=IKJEFT01\n"
              "//SYSTSPRT DD SYSOUT=*\n"
              "//SYSTSIN DD *\n"
              "  RECEIVE INDSNAME('%s')\n"
              "  RESTORE DATASET('%s')\n"
              "/*\n",
-             temp_dsn, target_dsn);
+             jobname, temp_dsn, target_dsn);
 
     size_t jcl_len = strlen(jcl);
     a2e_mem(jcl, jcl_len);
