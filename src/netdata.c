@@ -10,6 +10,10 @@
 #include "netdata.h"
 #include "utils.h"
 
+static const uint8_t inmr01_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF1};
+static const uint8_t inmr02_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF2};
+static const uint8_t inmr06_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF6};
+
 static uint16_t read_u16_be(const uint8_t *p)
 {
     return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
@@ -63,7 +67,6 @@ static void parse_text_units(const uint8_t *p, size_t len, netdata_info_t *info,
                     info->target_user[tlen] = '\0';
                     e2a_str(info->target_user);
                 } else if (key == 0x1024 && tlen < sizeof(info->timestamp)) {
-                    /* Format: YYYYMMDDHHMMSS */
                     char raw_ts[32];
                     size_t rlen = tlen < sizeof(raw_ts) - 1 ? tlen : sizeof(raw_ts) - 1;
                     memcpy(raw_ts, val, rlen);
@@ -110,7 +113,6 @@ static void parse_text_units(const uint8_t *p, size_t len, netdata_info_t *info,
                 } else if (key == INMBLKSIZE_KEY) {
                     info->blksize = read_u32_be(val, tlen);
                 } else if (key == 0x1028 && tlen < sizeof(info->utility_name)) {
-                    /* Utility name in INMR02 e.g. INMCOPY, IEBCOPY */
                     memcpy(info->utility_name, val, tlen);
                     info->utility_name[tlen] = '\0';
                     e2a_str(info->utility_name);
@@ -139,15 +141,20 @@ int netdata_parse_header(const uint8_t *buffer, size_t buflen, netdata_info_t *i
         const uint8_t *payload = buffer + offset + 2;
         size_t payload_len = seg_len - 2;
 
-        /* Control segment if flags & 0x20 == 0 */
-        if ((flags & 0x20) == 0 && payload_len >= 6) {
-            if (memcmp(payload, INMR01_EYECATCHER, 6) == 0) {
+        /* Control segment if flags & 0x20 != 0 */
+        if ((flags & 0x20) != 0 && payload_len >= 6) {
+            if (memcmp(payload, inmr01_eye, 6) == 0) {
                 info->has_inmr01 = true;
-                parse_text_units(payload + 6, payload_len - 6, info, false);
-            } else if (memcmp(payload, INMR02_EYECATCHER, 6) == 0) {
+                if (payload_len > 6) {
+                    parse_text_units(payload + 6, payload_len - 6, info, false);
+                }
+            } else if (memcmp(payload, inmr02_eye, 6) == 0) {
                 info->has_inmr02 = true;
-                parse_text_units(payload + 6, payload_len - 6, info, true);
-            } else if (memcmp(payload, INMR06_EYECATCHER, 6) == 0) {
+                /* INMR02 has 4-byte file number after 6-byte eyecatcher */
+                if (payload_len > 10) {
+                    parse_text_units(payload + 10, payload_len - 10, info, true);
+                }
+            } else if (memcmp(payload, inmr06_eye, 6) == 0) {
                 break;
             }
         }
