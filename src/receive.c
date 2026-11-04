@@ -26,7 +26,17 @@ static int wait_for_job(const char *jobid, int timeout_secs)
             char line[256];
             bool done = false;
             while (fgets(line, sizeof(line), p)) {
-                if (strstr(line, jobid) && strstr(line, "OUTPUT QUEUE")) {
+                /* Line is ASCII if tsocmd output converted by shell / popen */
+                /* Check for both ASCII and EBCDIC matches */
+                if (strstr(line, jobid) && (strstr(line, "OUTPUT QUEUE") || strstr(line, "output queue"))) {
+                    done = true;
+                    break;
+                }
+                char eline[256];
+                strncpy(eline, line, sizeof(eline) - 1);
+                eline[sizeof(eline) - 1] = '\0';
+                e2a_str(eline);
+                if (strstr(eline, jobid) && (strstr(eline, "OUTPUT QUEUE") || strstr(eline, "output queue"))) {
                     done = true;
                     break;
                 }
@@ -99,26 +109,31 @@ int do_receive(const ussxmit_opts_t *opts)
         dynalloc_delete_dsn(target_dsn);
     }
 
-    /* Write temporary JCL file */
+    /* Write temporary JCL file in EBCDIC */
     char jcl_path[128];
     snprintf(jcl_path, sizeof(jcl_path), "/tmp/rcv_%d_%lx.jcl", (int)getpid(), (unsigned long)time(NULL));
 
-    FILE *jcl_fp = fopen(jcl_path, "w");
+    char jcl[1024];
+    snprintf(jcl, sizeof(jcl),
+             "//RCVJOB JOB (1),MSGCLASS=A,CLASS=A\n"
+             "//STEP1 EXEC PGM=IKJEFT01\n"
+             "//SYSTSPRT DD SYSOUT=*\n"
+             "//SYSTSIN DD *\n"
+             "  RECEIVE INDSNAME('%s')\n"
+             "  RESTORE DATASET('%s')\n"
+             "/*\n",
+             temp_dsn, target_dsn);
+
+    size_t jcl_len = strlen(jcl);
+    a2e_mem(jcl, jcl_len);
+
+    FILE *jcl_fp = fopen(jcl_path, "wb");
     if (!jcl_fp) {
         log_error("Failed to create temporary JCL file: %s", jcl_path);
         dynalloc_delete_dsn(temp_dsn);
         return RC_ERR_INTERNAL;
     }
-
-    fprintf(jcl_fp,
-            "//RCVJOB JOB (1),MSGCLASS=A,CLASS=A\n"
-            "//STEP1 EXEC PGM=IKJEFT01\n"
-            "//SYSTSPRT DD SYSOUT=*\n"
-            "//SYSTSIN DD *\n"
-            "  RECEIVE INDSNAME('%s')\n"
-            "  RESTORE DATASET('%s')\n"
-            "/*\n",
-            temp_dsn, target_dsn);
+    fwrite(jcl, 1, jcl_len, jcl_fp);
     fclose(jcl_fp);
 
     /* Submit JCL and capture Job ID */
@@ -130,7 +145,8 @@ int do_receive(const ussxmit_opts_t *opts)
     char jobid[64] = {0};
     if (p) {
         if (fgets(jobid, sizeof(jobid), p)) {
-            /* Trim trailing whitespace */
+            /* Decode EBCDIC from native submit command */
+            e2a_str(jobid);
             size_t jlen = strlen(jobid);
             while (jlen > 0 && (jobid[jlen - 1] == '\n' || jobid[jlen - 1] == '\r' || jobid[jlen - 1] == ' ')) {
                 jobid[--jlen] = '\0';
