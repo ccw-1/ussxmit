@@ -18,36 +18,32 @@ static int wait_for_job(const char *jobid, int timeout_secs)
     if (!jobid || !*jobid) return -1;
     log_verbose("Waiting for batch job %s to complete...", jobid);
 
-    for (int t = 0; t < timeout_secs * 2; t++) {
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "tsocmd \"STATUS\" 2>&1");
-        FILE *p = popen(cmd, "r");
+    for (int t = 0; t < timeout_secs; t++) {
+        FILE *p = popen("tsocmd \"STATUS\" 2>&1", "r");
         if (p) {
-            char line[256];
-            bool done = false;
-            while (fgets(line, sizeof(line), p)) {
-                /* Line is ASCII if tsocmd output converted by shell / popen */
-                /* Check for both ASCII and EBCDIC matches */
-                if (strstr(line, jobid) && (strstr(line, "OUTPUT QUEUE") || strstr(line, "output queue"))) {
-                    done = true;
-                    break;
-                }
-                char eline[256];
-                strncpy(eline, line, sizeof(eline) - 1);
-                eline[sizeof(eline) - 1] = '\0';
-                e2a_str(eline);
-                if (strstr(eline, jobid) && (strstr(eline, "OUTPUT QUEUE") || strstr(eline, "output queue"))) {
-                    done = true;
-                    break;
-                }
-            }
+            char buf[8192];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, p);
             pclose(p);
-            if (done) {
-                log_verbose("Job %s completed successfully", jobid);
-                return 0;
+            buf[n] = '\0';
+            e2a_mem(buf, n);
+
+            char *pos = strstr(buf, jobid);
+            if (pos) {
+                /* Find the line or segment containing this job */
+                char *end = strchr(pos, '\n');
+                if (!end) end = pos + strlen(pos);
+                char line[256];
+                size_t llen = (size_t)(end - pos) < sizeof(line) - 1 ? (size_t)(end - pos) : sizeof(line) - 1;
+                memcpy(line, pos, llen);
+                line[llen] = '\0';
+
+                if (strstr(line, "OUTPUT QUEUE")) {
+                    log_verbose("Job %s completed successfully", jobid);
+                    return 0;
+                }
             }
         }
-        usleep(500000); /* 500ms */
+        sleep(1);
     }
     log_error("Timeout waiting for job %s to complete", jobid);
     return -1;
