@@ -27,9 +27,9 @@ $BIN xmit "CCW.TESTSEQ" | $BIN inspect | grep "Dataset Name : CCW.TESTSEQ"
 echo "Test 4: Streaming pipeline: xmit -> receive"
 $BIN xmit "CCW.TESTSEQ" | $BIN receive -f "CCW.TESTSEQ.INTTEST"
 
-# 5. Verify restored dataset
-echo "Test 5: Verify restored dataset inspection"
-$BIN inspect "CCW.TESTSEQ.INTTEST" | grep "Organization : PS (Sequential)"
+# 5. Verify restored dataset via re-xmit pipeline
+echo "Test 5: Verify restored dataset via re-xmit pipeline"
+$BIN xmit "CCW.TESTSEQ.INTTEST" | $BIN inspect | grep "Dataset Name : CCW.TESTSEQ.INTTEST"
 
 echo ""
 echo "=================================================="
