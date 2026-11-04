@@ -13,6 +13,36 @@
 #include "dataset_io.h"
 #include "utils.h"
 
+static int wait_for_job(const char *jobid, int timeout_secs)
+{
+    if (!jobid || !*jobid) return -1;
+    log_verbose("Waiting for batch job %s to complete...", jobid);
+
+    for (int t = 0; t < timeout_secs * 2; t++) {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "tsocmd \"STATUS\" 2>&1");
+        FILE *p = popen(cmd, "r");
+        if (p) {
+            char line[256];
+            bool done = false;
+            while (fgets(line, sizeof(line), p)) {
+                if (strstr(line, jobid) && strstr(line, "OUTPUT QUEUE")) {
+                    done = true;
+                    break;
+                }
+            }
+            pclose(p);
+            if (done) {
+                log_verbose("Job %s completed successfully", jobid);
+                return 0;
+            }
+        }
+        usleep(500000); /* 500ms */
+    }
+    log_error("Timeout waiting for job %s to complete", jobid);
+    return -1;
+}
+
 int do_receive(const ussxmit_opts_t *opts)
 {
     if (!opts) return RC_ERR_SYNTAX;
@@ -47,8 +77,6 @@ int do_receive(const ussxmit_opts_t *opts)
     if (has_header) {
         log_verbose("Archive metadata: DSN=%s, DSORG=0x%04X, RECFM=0x%02X, LRECL=%u",
                     info.dataset_name, info.dsorg, info.recfm, info.lrecl);
-    } else {
-        log_verbose("Notice: could not parse INMR01/INMR02 header from first %zu bytes", sizeof(header_buf));
     }
 
     /* Determine target dataset name */
@@ -71,33 +99,61 @@ int do_receive(const ussxmit_opts_t *opts)
         dynalloc_delete_dsn(target_dsn);
     }
 
-    /* Prepare batch JCL for IKJEFT01 */
-    char jcl[1024];
-    snprintf(jcl, sizeof(jcl),
-             "//RCVJOB JOB (1),MSGCLASS=A,CLASS=A\n"
-             "//STEP1 EXEC PGM=IKJEFT01\n"
-             "//SYSTSPRT DD SYSOUT=*\n"
-             "//SYSTSIN DD *\n"
-             "  RECEIVE INDSNAME('%s')\n"
-             "  RESTORE DATASET('%s')\n"
-             "/*\n",
-             temp_dsn, target_dsn);
+    /* Write temporary JCL file */
+    char jcl_path[128];
+    snprintf(jcl_path, sizeof(jcl_path), "/tmp/rcv_%d_%lx.jcl", (int)getpid(), (unsigned long)time(NULL));
 
-    log_verbose("Submitting restore batch job...");
+    FILE *jcl_fp = fopen(jcl_path, "w");
+    if (!jcl_fp) {
+        log_error("Failed to create temporary JCL file: %s", jcl_path);
+        dynalloc_delete_dsn(temp_dsn);
+        return RC_ERR_INTERNAL;
+    }
 
-    /* Submit JCL via /bin/submit -jq */
-    FILE *p = popen("/bin/submit -jq /dev/fd/0", "w");
-    if (!p) {
-        log_error("Failed to invoke /bin/submit");
+    fprintf(jcl_fp,
+            "//RCVJOB JOB (1),MSGCLASS=A,CLASS=A\n"
+            "//STEP1 EXEC PGM=IKJEFT01\n"
+            "//SYSTSPRT DD SYSOUT=*\n"
+            "//SYSTSIN DD *\n"
+            "  RECEIVE INDSNAME('%s')\n"
+            "  RESTORE DATASET('%s')\n"
+            "/*\n",
+            temp_dsn, target_dsn);
+    fclose(jcl_fp);
+
+    /* Submit JCL and capture Job ID */
+    char submit_cmd[256];
+    snprintf(submit_cmd, sizeof(submit_cmd), "/bin/submit -jq %s 2>&1", jcl_path);
+
+    log_verbose("Submitting restore batch job: %s", submit_cmd);
+    FILE *p = popen(submit_cmd, "r");
+    char jobid[64] = {0};
+    if (p) {
+        if (fgets(jobid, sizeof(jobid), p)) {
+            /* Trim trailing whitespace */
+            size_t jlen = strlen(jobid);
+            while (jlen > 0 && (jobid[jlen - 1] == '\n' || jobid[jlen - 1] == '\r' || jobid[jlen - 1] == ' ')) {
+                jobid[--jlen] = '\0';
+            }
+        }
+        pclose(p);
+    }
+    unlink(jcl_path);
+
+    if (jobid[0] == '\0' || strstr(jobid, "JOB") == NULL) {
+        log_error("Failed to submit restore job (output: %s)", jobid);
         dynalloc_delete_dsn(temp_dsn);
         return RC_ERR_TSO;
     }
-    fputs(jcl, p);
-    fflush(p);
-    pclose(p);
 
-    /* Give JES a moment and check */
-    sleep(1);
+    log_verbose("Submitted job: %s", jobid);
+
+    /* Wait for batch job to finish */
+    if (wait_for_job(jobid, 30) != 0) {
+        log_error("Restore job %s did not complete within timeout", jobid);
+        dynalloc_delete_dsn(temp_dsn);
+        return RC_ERR_TSO;
+    }
 
     /* Clean up temporary staging dataset */
     dynalloc_delete_dsn(temp_dsn);
