@@ -1,0 +1,10 @@
+# Temporary and build artifacts
+._*
+*.o
+*.a
+*.so
+*.exe
+*.test
+*.out
+*.log
+*.tmp
