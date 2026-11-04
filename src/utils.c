@@ -47,7 +47,13 @@ void log_error(const char *fmt, ...)
     fprintf(stderr, "\n");
 }
 
-/* Fallback translation tables in case __a2e_l/__e2a_l are not linked */
+#if ' ' == 0x40
+/* Native EBCDIC environment: strings are already in IBM-1047 */
+void a2e_mem(char *buf, size_t len) { (void)buf; (void)len; }
+void e2a_mem(char *buf, size_t len) { (void)buf; (void)len; }
+
+#else
+/* ASCII compilation environment: translate to/from IBM-1047 */
 static const unsigned char a2e_tab[256] = {
     0x00,0x01,0x02,0x03,0x37,0x2D,0x2E,0x2F,0x16,0x05,0x15,0x0B,0x0C,0x0D,0x0E,0x0F,
     0x10,0x11,0x12,0x13,0x3C,0x3D,0x32,0x26,0x18,0x19,0x3F,0x27,0x1C,0x1D,0x1E,0x1F,
@@ -107,6 +113,7 @@ void e2a_mem(char *buf, size_t len)
     }
 #endif
 }
+#endif /* ' ' == 0x40 */
 
 void a2e_str(char *str)
 {

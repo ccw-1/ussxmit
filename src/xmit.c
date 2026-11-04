@@ -4,11 +4,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 
 #include "ussxmit.h"
+#include "netdata.h"
 #include "dynalloc.h"
-#include "dataset_io.h"
 #include "utils.h"
 
 int do_xmit(const ussxmit_opts_t *opts)
@@ -21,44 +22,104 @@ int do_xmit(const ussxmit_opts_t *opts)
     char src_dsn[64];
     dsn_normalize(src_dsn, sizeof(src_dsn), opts->source_dsn);
 
-    char temp_dsn[64];
-    if (dynalloc_temp_dsn(temp_dsn, sizeof(temp_dsn), "XMI") != 0) {
-        log_error("Failed to generate temporary dataset name");
+    log_verbose("Opening source dataset: %s", src_dsn);
+
+    /* Allocate source dataset to DD */
+    char alloc_cmd[256];
+    char msg[256];
+    snprintf(alloc_cmd, sizeof(alloc_cmd), "alloc fi(XMITIN) da('%s') shr", src_dsn);
+    int rc = dynalloc_str(alloc_cmd, msg, sizeof(msg));
+    if (rc != 0) {
+        log_error("Failed to dynamically allocate source dataset '%s': %s (rc=%d)", src_dsn, msg, rc);
+        return RC_ERR_ALLOC_SRC;
+    }
+
+    /* Open via DD */
+    FILE *fp = fopen("DD:XMITIN", "rb,type=record");
+    if (!fp) {
+        log_error("Failed to open DD:XMITIN for dataset '%s': %s", src_dsn, strerror(errno));
+        dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
+        return RC_ERR_ALLOC_SRC;
+    }
+
+    /* Retrieve dataset metadata via fldata */
+    fldata_t info;
+    char fname[128];
+    if (fldata(fp, fname, &info) != 0) {
+        log_error("fldata() failed for dataset '%s'", src_dsn);
+        fclose(fp);
+        dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
         return RC_ERR_INTERNAL;
     }
 
-    log_verbose("Source dataset: %s", src_dsn);
-    log_verbose("Staging dataset: %s", temp_dsn);
+    uint16_t dsorg = info.__dsorgPO ? DSORG_PO : DSORG_PS;
+    uint8_t recfm = 0;
+    if (info.__recfmU)      recfm |= RECFM_U;
+    else if (info.__recfmV) recfm |= RECFM_V;
+    else if (info.__recfmF) recfm |= RECFM_F;
+    if (info.__recfmBlk)    recfm |= RECFM_B;
+    if (info.__recfmS)      recfm |= RECFM_S;
+    if (info.__recfmASA)    recfm |= RECFM_A;
+    if (info.__recfmM)      recfm |= RECFM_M;
 
-    /* Ensure staging dataset name is clean / unallocated */
-    dynalloc_delete_dsn(temp_dsn);
+    uint32_t lrecl = (uint32_t)info.__maxreclen;
+    uint32_t blksize = (uint32_t)info.__blksize;
+    if (lrecl == 0) lrecl = 80;
+    if (blksize == 0) blksize = lrecl;
 
-    /* Execute TSO TRANSMIT command (TSO XMIT allocates OUTDSNAME automatically) */
-    char tso_cmd[256];
-    snprintf(tso_cmd, sizeof(tso_cmd),
-             "tsocmd \"XMIT (DUMMY.DUMMY) DATASET('%s') OUTDSNAME('%s') NOLOG\" > /dev/null 2>&1",
-             src_dsn, temp_dsn);
+    log_verbose("Dataset attributes: DSORG=0x%04X, RECFM=0x%02X, LRECL=%u, BLKSIZE=%u",
+                dsorg, recfm, lrecl, blksize);
 
-    log_verbose("Executing TSO command: %s", tso_cmd);
-    int rc = system(tso_cmd);
+    /* Initialize Netdata stream writer to STDOUT */
+    netdata_writer_t writer;
+    netdata_writer_init(&writer, stdout);
 
-    if (rc != 0) {
-        log_error("TSO TRANSMIT command failed with status %d for dataset '%s'", rc, src_dsn);
-        dynalloc_delete_dsn(temp_dsn);
-        return RC_ERR_TSO;
-    }
-
-    /* Stream records from staging dataset to stdout */
-    size_t count = 0;
-    if (dataset_to_stream(temp_dsn, stdout, &count) != 0) {
-        log_error("Failed to stream dataset records to stdout");
-        dynalloc_delete_dsn(temp_dsn);
+    /* Emit INMR01 Transmission Header */
+    if (netdata_writer_emit_inmr01(&writer, "POK", get_current_hlq()) != 0) {
+        log_error("Failed to emit INMR01 record");
+        fclose(fp);
+        dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
         return RC_ERR_STREAM;
     }
 
-    /* Clean up temporary staging dataset */
-    dynalloc_delete_dsn(temp_dsn);
+    /* Emit INMR02 Dataset Utility / Attributes */
+    if (netdata_writer_emit_inmr02(&writer, src_dsn, dsorg, recfm, lrecl, blksize) != 0) {
+        log_error("Failed to emit INMR02 record");
+        fclose(fp);
+        dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
+        return RC_ERR_STREAM;
+    }
 
-    log_verbose("Successfully transmitted %zu records from %s", count, src_dsn);
+    /* Read dataset records directly and stream Netdata data segments */
+    uint8_t rec_buf[32768];
+    size_t count = 0;
+    size_t nread;
+
+    while ((nread = fread(rec_buf, 1, sizeof(rec_buf), fp)) > 0) {
+        if (netdata_writer_emit_data(&writer, rec_buf, nread) != 0) {
+            log_error("Failed writing data segment for record %zu", count + 1);
+            fclose(fp);
+            dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
+            return RC_ERR_STREAM;
+        }
+        count++;
+    }
+
+    /* Emit INMR06 Trailer */
+    if (netdata_writer_emit_inmr06(&writer) != 0) {
+        log_error("Failed to emit INMR06 record");
+        fclose(fp);
+        dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
+        return RC_ERR_STREAM;
+    }
+
+    /* Flush and pad final 80-byte record */
+    netdata_writer_flush(&writer);
+
+    fclose(fp);
+    dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
+
+    log_verbose("Successfully streamed %zu records (%zu physical 80-byte blocks) from %s to stdout",
+                count, writer.total_records_written, src_dsn);
     return RC_SUCCESS;
 }

@@ -6,12 +6,15 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "netdata.h"
 #include "utils.h"
 
 static const uint8_t inmr01_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF1};
 static const uint8_t inmr02_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF2};
+static const uint8_t inmr03_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF3};
 static const uint8_t inmr06_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF6};
 
 static uint16_t read_u16_be(const uint8_t *p)
@@ -28,7 +31,323 @@ static uint32_t read_u32_be(const uint8_t *p, size_t len)
     return val;
 }
 
-/* Parse Text Units from a control record buffer (EBCDIC) */
+static void write_u16_be(uint8_t *p, uint16_t val)
+{
+    p[0] = (uint8_t)(val >> 8);
+    p[1] = (uint8_t)(val & 0xFF);
+}
+
+static void write_u32_be(uint8_t *p, uint32_t val)
+{
+    p[0] = (uint8_t)(val >> 24);
+    p[1] = (uint8_t)((val >> 16) & 0xFF);
+    p[2] = (uint8_t)((val >> 8) & 0xFF);
+    p[3] = (uint8_t)(val & 0xFF);
+}
+
+/* ================================================================== */
+/* Netdata Stream Writer (XMIT Encoder)                               */
+/* ================================================================== */
+
+void netdata_writer_init(netdata_writer_t *w, FILE *out_fp)
+{
+    if (!w) return;
+    w->out_fp = out_fp;
+    w->card_pos = 0;
+    w->total_records_written = 0;
+    w->total_bytes_written = 0;
+    memset(w->card_buf, 0x40, sizeof(w->card_buf));
+}
+
+int netdata_writer_put_segment(netdata_writer_t *w, uint8_t flags, const uint8_t *data, size_t len)
+{
+    if (!w || !w->out_fp || len > 253) return -1;
+
+    uint8_t seg_hdr[2];
+    seg_hdr[0] = (uint8_t)(len + 2);
+    seg_hdr[1] = flags;
+
+    /* Write 2-byte segment header across 80-byte card boundary */
+    for (int h = 0; h < 2; h++) {
+        w->card_buf[w->card_pos++] = seg_hdr[h];
+        if (w->card_pos == 80) {
+            if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
+            w->total_records_written++;
+            w->total_bytes_written += 80;
+            w->card_pos = 0;
+            memset(w->card_buf, 0x40, sizeof(w->card_buf));
+        }
+    }
+
+    /* Write segment payload across 80-byte card boundary */
+    for (size_t i = 0; i < len; i++) {
+        w->card_buf[w->card_pos++] = data[i];
+        if (w->card_pos == 80) {
+            if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
+            w->total_records_written++;
+            w->total_bytes_written += 80;
+            w->card_pos = 0;
+            memset(w->card_buf, 0x40, sizeof(w->card_buf));
+        }
+    }
+
+    return 0;
+}
+
+int netdata_writer_emit_inmr01(netdata_writer_t *w, const char *node, const char *user)
+{
+    uint8_t buf[256];
+    size_t off = 0;
+
+    /* 6-byte eyecatcher INMR01 */
+    memcpy(buf + off, inmr01_eye, 6);
+    off += 6;
+
+    /* TU 0x0042 (1 byte, 0x50) */
+    write_u16_be(buf + off, 0x0042); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    buf[off++] = 0x50;
+
+    /* TU 0x1011: Origin Node */
+    char origin_node[16];
+    if (!node || !*node) node = "POK";
+    strncpy(origin_node, node, sizeof(origin_node) - 1);
+    origin_node[sizeof(origin_node) - 1] = '\0';
+    a2e_str(origin_node);
+    size_t nlen = strlen(node);
+    if (nlen > 8) nlen = 8;
+    write_u16_be(buf + off, 0x1011); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, (uint16_t)nlen); off += 2;
+    memcpy(buf + off, origin_node, nlen); off += nlen;
+
+    /* TU 0x1012: Origin User */
+    char origin_user[16];
+    if (!user || !*user) user = get_current_hlq();
+    strncpy(origin_user, user, sizeof(origin_user) - 1);
+    origin_user[sizeof(origin_user) - 1] = '\0';
+    a2e_str(origin_user);
+    size_t ulen = strlen(user);
+    if (ulen > 8) ulen = 8;
+    write_u16_be(buf + off, 0x1012); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, (uint16_t)ulen); off += 2;
+    memcpy(buf + off, origin_user, ulen); off += ulen;
+
+    /* TU 0x1001: Target Node */
+    write_u16_be(buf + off, 0x1001); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 5);      off += 2;
+    char dummy_node[] = "DUMMY";
+    a2e_str(dummy_node);
+    memcpy(buf + off, dummy_node, 5); off += 5;
+
+    /* TU 0x1002: Target User */
+    write_u16_be(buf + off, 0x1002); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 5);      off += 2;
+    char dummy_user[] = "DUMMY";
+    a2e_str(dummy_user);
+    memcpy(buf + off, dummy_user, 5); off += 5;
+
+    /* TU 0x1024: Timestamp (YYYYMMDDHHMMSS) */
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char ts[16];
+    snprintf(ts, sizeof(ts), "%04d%02d%02d%02d%02d%02d",
+             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+             tm->tm_hour, tm->tm_min, tm->tm_sec);
+    a2e_str(ts);
+    write_u16_be(buf + off, 0x1024); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 14);     off += 2;
+    memcpy(buf + off, ts, 14); off += 14;
+
+    /* TU 0x102F (1 byte, 0x01) */
+    write_u16_be(buf + off, 0x102F); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    buf[off++] = 0x01;
+
+    return netdata_writer_put_segment(w, 0xE0, buf, off);
+}
+
+int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize)
+{
+    uint8_t buf[256];
+    size_t off = 0;
+
+    /* 6-byte eyecatcher INMR02 */
+    memcpy(buf + off, inmr02_eye, 6);
+    off += 6;
+
+    /* 4-byte file number: 0x00000001 */
+    write_u32_be(buf + off, 1);
+    off += 4;
+
+    /* TU 0x1028: Utility Name (INMCOPY) */
+    char util[16] = "INMCOPY";
+    a2e_str(util);
+    write_u16_be(buf + off, 0x1028); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 7);      off += 2;
+    memcpy(buf + off, util, 7); off += 7;
+
+    /* TU 0x102C: Flags (0x00 0x01 0x80 0x00) */
+    write_u16_be(buf + off, 0x102C); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 4);      off += 2;
+    buf[off++] = 0x00; buf[off++] = 0x01; buf[off++] = 0x80; buf[off++] = 0x00;
+
+    /* TU 0x003C: DSORG (2 bytes) */
+    write_u16_be(buf + off, 0x003C); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 2);      off += 2;
+    write_u16_be(buf + off, dsorg);  off += 2;
+
+    /* TU 0x0042: LRECL (4 bytes) */
+    write_u16_be(buf + off, 0x0042); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 4);      off += 2;
+    write_u32_be(buf + off, lrecl);  off += 4;
+
+    /* TU 0x0030: BLKSIZE (4 bytes) */
+    write_u16_be(buf + off, 0x0030); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 4);      off += 2;
+    write_u32_be(buf + off, blksize ? blksize : lrecl); off += 4;
+
+    /* TU 0x0049: RECFM (2 bytes: recfm flags + 0x02) */
+    write_u16_be(buf + off, 0x0049); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 2);      off += 2;
+    buf[off++] = recfm;
+    buf[off++] = 0x02;
+
+    /* TU 0x0002: INMDSNAM (split qualifiers) */
+    char norm_dsn[64];
+    dsn_normalize(norm_dsn, sizeof(norm_dsn), dsn);
+
+    char *quals[16];
+    int qcnt = 0;
+    char dsn_copy[64];
+    strncpy(dsn_copy, norm_dsn, sizeof(dsn_copy) - 1);
+    dsn_copy[sizeof(dsn_copy) - 1] = '\0';
+
+    char *token = strtok(dsn_copy, ".");
+    while (token && qcnt < 16) {
+        quals[qcnt++] = token;
+        token = strtok(NULL, ".");
+    }
+
+    if (qcnt > 0) {
+        write_u16_be(buf + off, 0x0002); off += 2;
+        write_u16_be(buf + off, (uint16_t)qcnt); off += 2;
+        for (int q = 0; q < qcnt; q++) {
+            size_t ql = strlen(quals[q]);
+            char qe[16];
+            strncpy(qe, quals[q], sizeof(qe) - 1);
+            qe[sizeof(qe) - 1] = '\0';
+            a2e_str(qe);
+            write_u16_be(buf + off, (uint16_t)ql); off += 2;
+            memcpy(buf + off, qe, ql); off += ql;
+        }
+    }
+
+    return netdata_writer_put_segment(w, 0xE0, buf, off);
+}
+
+int netdata_writer_emit_inmr03(netdata_writer_t *w, uint16_t dsorg, uint8_t recfm, uint32_t lrecl)
+{
+    uint8_t buf[128];
+    size_t off = 0;
+
+    memcpy(buf + off, inmr03_eye, 6);
+    off += 6;
+
+    write_u16_be(buf + off, 0x102C); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 4);      off += 2;
+    buf[off++] = 0x00; buf[off++] = 0x01; buf[off++] = 0x80; buf[off++] = 0x00;
+
+    write_u16_be(buf + off, 0x003C); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 2);      off += 2;
+    write_u16_be(buf + off, dsorg);  off += 2;
+
+    write_u16_be(buf + off, 0x0042); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 2);      off += 2;
+    write_u16_be(buf + off, (uint16_t)lrecl); off += 2;
+
+    write_u16_be(buf + off, 0x0049); off += 2;
+    write_u16_be(buf + off, 1);      off += 2;
+    write_u16_be(buf + off, 2);      off += 2;
+    buf[off++] = 0x00; buf[off++] = (uint8_t)(recfm & 0x01);
+
+    return netdata_writer_put_segment(w, 0xE0, buf, off);
+}
+
+int netdata_writer_emit_data(netdata_writer_t *w, const uint8_t *data, size_t len)
+{
+    if (!w || !data) return -1;
+
+    if (len <= 253) {
+        /* Single segment data record */
+        return netdata_writer_put_segment(w, 0xC0, data, len);
+    }
+
+    /* Spanned logical record */
+    size_t offset = 0;
+    bool first = true;
+
+    while (offset < len) {
+        size_t chunk = len - offset;
+        if (chunk > 253) chunk = 253;
+
+        bool last = (offset + chunk >= len);
+        uint8_t flags;
+        if (first && last)   flags = 0xC0;
+        else if (first)      flags = 0x80;
+        else if (last)       flags = 0x40;
+        else                 flags = 0x00;
+
+        if (netdata_writer_put_segment(w, flags, data + offset, chunk) != 0) return -1;
+        offset += chunk;
+        first = false;
+    }
+
+    return 0;
+}
+
+int netdata_writer_emit_inmr06(netdata_writer_t *w)
+{
+    uint8_t buf[8];
+    memcpy(buf, inmr06_eye, 6);
+    return netdata_writer_put_segment(w, 0xE0, buf, 6);
+}
+
+int netdata_writer_flush(netdata_writer_t *w)
+{
+    if (!w || !w->out_fp) return -1;
+
+    if (w->card_pos > 0) {
+        /* Pad remaining bytes in 80-byte card with EBCDIC space 0x40 */
+        memset(w->card_buf + w->card_pos, 0x40, 80 - w->card_pos);
+        if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
+        w->total_records_written++;
+        w->total_bytes_written += 80;
+        w->card_pos = 0;
+    }
+    fflush(w->out_fp);
+    return 0;
+}
+
+/* ================================================================== */
+/* Netdata Parser (RECEIVE / Inspect Decoder)                         */
+/* ================================================================== */
+
 static void parse_text_units(const uint8_t *p, size_t len, netdata_info_t *info, bool is_inmr02)
 {
     size_t offset = 0;
@@ -150,7 +469,6 @@ int netdata_parse_header(const uint8_t *buffer, size_t buflen, netdata_info_t *i
                 }
             } else if (memcmp(payload, inmr02_eye, 6) == 0) {
                 info->has_inmr02 = true;
-                /* INMR02 has 4-byte file number after 6-byte eyecatcher */
                 if (payload_len > 10) {
                     parse_text_units(payload + 10, payload_len - 10, info, true);
                 }
