@@ -53,6 +53,15 @@ int do_inspect(const ussxmit_opts_t *opts)
         dynalloc_str("free fi(INSPDD)", msg, sizeof(msg));
     }
 
+    log_verbose("do_inspect: read %zu bytes from input source", nread);
+    if (nread >= 80) {
+        log_verbose("do_inspect: first 16 bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                    (uint8_t)header_buf[0], (uint8_t)header_buf[1], (uint8_t)header_buf[2], (uint8_t)header_buf[3],
+                    (uint8_t)header_buf[4], (uint8_t)header_buf[5], (uint8_t)header_buf[6], (uint8_t)header_buf[7],
+                    (uint8_t)header_buf[8], (uint8_t)header_buf[9], (uint8_t)header_buf[10], (uint8_t)header_buf[11],
+                    (uint8_t)header_buf[12], (uint8_t)header_buf[13], (uint8_t)header_buf[14], (uint8_t)header_buf[15]);
+    }
+
     if (nread < 80) {
         log_error("Input source contains fewer than 80 bytes");
         return RC_ERR_STREAM;
@@ -60,7 +69,8 @@ int do_inspect(const ussxmit_opts_t *opts)
 
     netdata_info_t info;
     if (netdata_parse_header((const uint8_t *)header_buf, nread, &info) != 0) {
-        log_error("Failed to parse Netdata INMR01/INMR02 headers from input source");
+        log_error("Failed to parse Netdata INMR01/INMR02 headers from input source (has_inmr01=%d, has_inmr02=%d)",
+                  info.has_inmr01, info.has_inmr02);
         return RC_ERR_STREAM;
     }
 

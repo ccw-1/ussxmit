@@ -538,19 +538,23 @@ int netdata_reader_feed(netdata_reader_t *r, const uint8_t *buf, size_t len)
 static int header_parse_cb(bool is_control, const uint8_t *data, size_t len, void *user_data)
 {
     netdata_info_t *info = (netdata_info_t *)user_data;
+    log_verbose("header_parse_cb: is_control=%d, len=%zu", is_control, len);
     if (!is_control || len < 6) return 0;
 
     if (memcmp(data, inmr01_eye, 6) == 0) {
+        log_verbose("header_parse_cb: found INMR01");
         info->has_inmr01 = true;
         if (len > 6) {
             netdata_parse_text_units(data + 6, len - 6, info, false);
         }
     } else if (memcmp(data, inmr02_eye, 6) == 0) {
+        log_verbose("header_parse_cb: found INMR02");
         info->has_inmr02 = true;
         if (len > 10) {
             netdata_parse_text_units(data + 10, len - 10, info, true);
         }
     } else if (memcmp(data, inmr06_eye, 6) == 0) {
+        log_verbose("header_parse_cb: found INMR06");
         return 1; /* Stop on trailer */
     }
 
