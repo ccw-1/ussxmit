@@ -1,4 +1,4 @@
-CC ?= /home/opnzos/local/openxl/bin/clang
+CC ?= $(shell if [ -x "$$HOME/clang" ]; then echo "$$HOME/clang"; else echo "clang"; fi)
 CFLAGS ?= -O2 -fzos-le-char-mode=ascii -D_EXT -D_XOPEN_SOURCE_EXTENDED=1 -I./include -Wall
 LDFLAGS ?=
 
