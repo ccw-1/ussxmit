@@ -19,11 +19,15 @@ SRCS = $(SRCDIR)/main.c \
 OBJS = $(patsubst $(SRCDIR)/%.c, $(OBJDIR)/%.o, $(SRCS))
 
 TARGET = $(BINDIR)/ussxmit
+TEST_TARGET = $(BINDIR)/test_netdata
 
 all: $(TARGET) symlinks
 
 $(TARGET): $(OBJS) | $(BINDIR)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS)
+
+$(TEST_TARGET): tests/test_netdata.c $(OBJDIR)/netdata.o $(OBJDIR)/dynalloc.o $(OBJDIR)/utils.o | $(BINDIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_netdata.c $(OBJDIR)/netdata.o $(OBJDIR)/dynalloc.o $(OBJDIR)/utils.o
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -38,7 +42,10 @@ symlinks: $(TARGET)
 	ln -sf ussxmit $(BINDIR)/xmit
 	ln -sf ussxmit $(BINDIR)/receive
 
+test: $(TEST_TARGET)
+	./$(TEST_TARGET)
+
 clean:
 	rm -rf $(OBJDIR) $(BINDIR)
 
-.PHONY: all clean symlinks
+.PHONY: all clean symlinks test
