@@ -71,7 +71,7 @@ typedef struct {
 } netdata_writer_t;
 
 void netdata_writer_init(netdata_writer_t *w, FILE *out_fp);
-int  netdata_writer_put_segment(netdata_writer_t *w, uint8_t flags, const uint8_t *data, size_t len);
+int  netdata_writer_emit_record(netdata_writer_t *w, bool is_control, const uint8_t *data, size_t len);
 int  netdata_writer_emit_inmr01(netdata_writer_t *w, const char *node, const char *user);
 int  netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize);
 int  netdata_writer_emit_inmr03(netdata_writer_t *w, uint16_t dsorg, uint8_t recfm, uint32_t lrecl);
@@ -79,7 +79,29 @@ int  netdata_writer_emit_data(netdata_writer_t *w, const uint8_t *data, size_t l
 int  netdata_writer_emit_inmr06(netdata_writer_t *w);
 int  netdata_writer_flush(netdata_writer_t *w);
 
-/* Parse Netdata header from buffer */
+/* Callback invoked for each assembled logical record */
+typedef int (*netdata_record_cb_t)(bool is_control, const uint8_t *data, size_t len, void *user_data);
+
+/* Netdata Card / Stream Reader */
+typedef struct {
+    uint8_t             assembly_buf[65536];
+    size_t              assembly_len;
+    bool                assembly_is_control;
+    bool                in_spanned_record;
+    netdata_record_cb_t record_cb;
+    void               *user_data;
+    size_t              total_cards_read;
+    size_t              total_records_dispatched;
+} netdata_reader_t;
+
+void netdata_reader_init(netdata_reader_t *r, netdata_record_cb_t cb, void *user_data);
+int  netdata_reader_feed_card(netdata_reader_t *r, const uint8_t card[80]);
+int  netdata_reader_feed(netdata_reader_t *r, const uint8_t *buf, size_t len);
+
+/* Parse Netdata text units from INMR01/INMR02 control record payload */
+void netdata_parse_text_units(const uint8_t *p, size_t len, netdata_info_t *info, bool is_inmr02);
+
+/* Parse Netdata header from buffer or 80-byte card stream */
 int  netdata_parse_header(const uint8_t *buffer, size_t buflen, netdata_info_t *info);
 
 /* Format DSORG and RECFM into human-readable strings */

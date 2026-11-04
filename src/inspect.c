@@ -9,20 +9,58 @@
 #include "netdata.h"
 #include "utils.h"
 
+#include "dynalloc.h"
+
 int do_inspect(const ussxmit_opts_t *opts)
 {
-    (void)opts;
-    char header_buf[4096];
-    size_t nread = fread(header_buf, 1, sizeof(header_buf), stdin);
+    char header_buf[8192];
+    size_t nread = 0;
+    FILE *fp = NULL;
+    char msg[256];
+    bool is_dd = false;
+
+    if (opts && opts->source_dsn[0] != '\0') {
+        char src_dsn[64];
+        dsn_normalize(src_dsn, sizeof(src_dsn), opts->source_dsn);
+        char alloc_cmd[256];
+        snprintf(alloc_cmd, sizeof(alloc_cmd), "alloc fi(INSPDD) da('%s') shr", src_dsn);
+        int rc = dynalloc_str(alloc_cmd, msg, sizeof(msg));
+        if (rc != 0) {
+            log_error("Failed to dynamically allocate dataset '%s': %s", src_dsn, msg);
+            return RC_ERR_ALLOC_SRC;
+        }
+        fp = fopen("DD:INSPDD", "rb,type=record");
+        if (!fp) {
+            log_error("Failed to open DD:INSPDD for dataset '%s'", src_dsn);
+            dynalloc_str("free fi(INSPDD)", msg, sizeof(msg));
+            return RC_ERR_ALLOC_SRC;
+        }
+        is_dd = true;
+    } else {
+        fp = stdin;
+    }
+
+    /* Read up to 8192 bytes (or 100 80-byte cards) */
+    while (nread + 80 <= sizeof(header_buf)) {
+        size_t n = fread(header_buf + nread, 1, is_dd ? 80 : sizeof(header_buf) - nread, fp);
+        if (n == 0) break;
+        nread += n;
+        if (nread >= 4096) break;
+    }
+
+    if (is_dd) {
+        fclose(fp);
+        dynalloc_str("free fi(INSPDD)", msg, sizeof(msg));
+    }
 
     if (nread < 80) {
-        log_error("Input stream contains fewer than 80 bytes");
+        log_error("Input source contains fewer than 80 bytes");
         return RC_ERR_STREAM;
     }
 
     netdata_info_t info;
     if (netdata_parse_header((const uint8_t *)header_buf, nread, &info) != 0) {
-        log_error("Failed to parse Netdata INMR01/INMR02 headers from input stream");
+        log_error("Failed to parse Netdata INMR01/INMR02 headers from input source");
         return RC_ERR_STREAM;
     }
 

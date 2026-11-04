@@ -17,192 +17,153 @@ static const uint8_t inmr01_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF1};
 static const uint8_t inmr02_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF2};
 static const uint8_t inmr06_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF6};
 
+typedef struct {
+    const ussxmit_opts_t *opts;
+    netdata_info_t        info;
+    char                  target_dsn[64];
+    FILE                 *out_fp;
+    bool                  target_allocated;
+    size_t                records_restored;
+    int                   error_code;
+} receive_state_t;
+
+static int receive_record_cb(bool is_control, const uint8_t *data, size_t len, void *user_data)
+{
+    receive_state_t *st = (receive_state_t *)user_data;
+    char msg[256];
+
+    if (is_control) {
+        if (len >= 6 && memcmp(data, inmr01_eye, 6) == 0) {
+            log_verbose("Processing INMR01 transmission header");
+            st->info.has_inmr01 = true;
+            if (len > 6) {
+                netdata_parse_text_units(data + 6, len - 6, &st->info, false);
+            }
+        } else if (len >= 6 && memcmp(data, inmr02_eye, 6) == 0) {
+            log_verbose("Processing INMR02 dataset attributes");
+            st->info.has_inmr02 = true;
+            if (len > 10) {
+                netdata_parse_text_units(data + 10, len - 10, &st->info, true);
+            }
+
+            if (st->target_dsn[0] == '\0') {
+                if (st->info.dataset_name[0] != '\0') {
+                    dsn_normalize(st->target_dsn, sizeof(st->target_dsn), st->info.dataset_name);
+                } else {
+                    log_error("Target dataset name not specified and not present in header");
+                    st->error_code = RC_ERR_SYNTAX;
+                    return -1;
+                }
+            }
+
+            log_info("Restoring dataset to: %s", st->target_dsn);
+
+            if (st->opts->force) {
+                dynalloc_delete_dsn(st->target_dsn);
+            }
+
+            char recfm_str[16];
+            if ((st->info.recfm & RECFM_U) == RECFM_U) {
+                snprintf(recfm_str, sizeof(recfm_str), "u");
+            } else if (st->info.recfm & RECFM_V) {
+                snprintf(recfm_str, sizeof(recfm_str), (st->info.recfm & RECFM_B) ? "v,b" : "v");
+            } else {
+                snprintf(recfm_str, sizeof(recfm_str), (st->info.recfm & RECFM_B) ? "f,b" : "f");
+            }
+
+            uint32_t lrecl = st->info.lrecl ? st->info.lrecl : 80;
+            uint32_t blksize = st->info.blksize ? st->info.blksize : 3120;
+
+            char dir_str[32] = "";
+            if (st->info.dsorg & DSORG_PO) {
+                uint32_t dir_blk = st->info.dir_blocks ? st->info.dir_blocks : 20;
+                snprintf(dir_str, sizeof(dir_str), " dir(%u)", dir_blk);
+            }
+
+            char alloc_cmd[256];
+            snprintf(alloc_cmd, sizeof(alloc_cmd),
+                     "alloc fi(RCVOUT) da('%s') new catalog tracks space(10,50)%s recfm(%s) lrecl(%u) blksize(%u)",
+                     st->target_dsn, dir_str, recfm_str, lrecl, blksize);
+
+            log_verbose("Allocating target dataset: %s", alloc_cmd);
+            int rc = dynalloc_str(alloc_cmd, msg, sizeof(msg));
+            if (rc != 0) {
+                log_error("Failed allocating target dataset '%s': %s (rc=%d)", st->target_dsn, msg, rc);
+                st->error_code = RC_ERR_ALLOC_TGT;
+                return -1;
+            }
+            st->target_allocated = true;
+
+            st->out_fp = fopen("DD:RCVOUT", "wb,type=record");
+            if (!st->out_fp) {
+                log_error("Failed to open DD:RCVOUT for dataset '%s': %s", st->target_dsn, strerror(errno));
+                dynalloc_str("free fi(RCVOUT)", msg, sizeof(msg));
+                st->error_code = RC_ERR_ALLOC_TGT;
+                return -1;
+            }
+        } else if (len >= 6 && memcmp(data, inmr06_eye, 6) == 0) {
+            log_verbose("Processing INMR06 trailer (end of transmission)");
+            return 1; /* Stop processing */
+        }
+    } else {
+        /* Data Record */
+        if (!st->out_fp) {
+            log_error("Encountered data segment before dataset allocation");
+            st->error_code = RC_ERR_STREAM;
+            return -1;
+        }
+
+        if (fwrite(data, 1, len, st->out_fp) != len) {
+            log_error("Failed writing record %zu to dataset", st->records_restored + 1);
+            st->error_code = RC_ERR_STREAM;
+            return -1;
+        }
+        st->records_restored++;
+    }
+
+    return 0;
+}
+
 int do_receive(const ussxmit_opts_t *opts)
 {
     if (!opts) return RC_ERR_SYNTAX;
 
-    /* Stream state */
-    netdata_info_t info;
-    memset(&info, 0, sizeof(info));
+    receive_state_t state;
+    memset(&state, 0, sizeof(state));
+    state.opts = opts;
 
-    char target_dsn[64] = {0};
     if (opts->target_dsn[0] != '\0') {
-        dsn_normalize(target_dsn, sizeof(target_dsn), opts->target_dsn);
+        dsn_normalize(state.target_dsn, sizeof(state.target_dsn), opts->target_dsn);
     }
 
-    FILE *out_fp = NULL;
-    char msg[256];
-    bool target_allocated = false;
-    size_t records_restored = 0;
+    uint8_t card_buf[80];
+    netdata_reader_t reader;
+    netdata_reader_init(&reader, receive_record_cb, &state);
 
-    /* Spanned logical record assembly buffer */
-    uint8_t rec_assembly[65536];
-    size_t  rec_assembly_len = 0;
-
-    /* Continuous stream buffer */
-    uint8_t  stream_buf[4096];
-    size_t   stream_len = 0;
-    size_t   stream_pos = 0;
-    bool     eof_reached = false;
-
-    while (true) {
-        /* Keep stream buffer topped up */
-        if (stream_pos > 0 && stream_pos < stream_len) {
-            memmove(stream_buf, stream_buf + stream_pos, stream_len - stream_pos);
-            stream_len -= stream_pos;
-            stream_pos = 0;
-        } else if (stream_pos >= stream_len) {
-            stream_len = 0;
-            stream_pos = 0;
-        }
-
-        if (stream_len < 256 && !eof_reached) {
-            size_t n = fread(stream_buf + stream_len, 1, sizeof(stream_buf) - stream_len, stdin);
-            if (n > 0) {
-                stream_len += n;
-            } else {
-                eof_reached = true;
-            }
-        }
-
-        if (stream_len - stream_pos < 2) {
-            break; /* No more segment data */
-        }
-
-        uint8_t seg_len = stream_buf[stream_pos];
-        uint8_t flags   = stream_buf[stream_pos + 1];
-
-        if (seg_len < 2) {
-            /* Padding or end of stream */
+    while (fread(card_buf, 1, 80, stdin) == 80) {
+        int rc = netdata_reader_feed_card(&reader, card_buf);
+        if (rc > 0) {
+            /* Clean stop on INMR06 */
             break;
         }
-
-        if (stream_pos + seg_len > stream_len) {
-            if (eof_reached) {
-                log_error("Truncated XMIT stream segment at offset %zu (need %u bytes, have %zu)",
-                          stream_pos, seg_len, stream_len - stream_pos);
-                break;
-            }
-            /* Need more bytes from stdin */
-            continue;
+        if (rc < 0) {
+            if (state.error_code == 0) state.error_code = RC_ERR_STREAM;
+            break;
         }
-
-        const uint8_t *payload = stream_buf + stream_pos + 2;
-        size_t payload_len = seg_len - 2;
-
-        /* Process Segment */
-        if (flags & 0x20) {
-            /* Control Record */
-            if (payload_len >= 6 && memcmp(payload, inmr01_eye, 6) == 0) {
-                log_verbose("Processing INMR01 transmission header");
-            } else if (payload_len >= 6 && memcmp(payload, inmr02_eye, 6) == 0) {
-                log_verbose("Processing INMR02 dataset attributes");
-                netdata_parse_header(stream_buf + stream_pos, seg_len, &info);
-
-                if (target_dsn[0] == '\0') {
-                    if (info.dataset_name[0] != '\0') {
-                        dsn_normalize(target_dsn, sizeof(target_dsn), info.dataset_name);
-                    } else {
-                        log_error("Target dataset name not specified and not present in header");
-                        return RC_ERR_SYNTAX;
-                    }
-                }
-
-                log_info("Restoring dataset to: %s", target_dsn);
-
-                /* If force enabled, delete existing dataset */
-                if (opts->force) {
-                    dynalloc_delete_dsn(target_dsn);
-                }
-
-                /* Allocate target dataset via BPXWDYN */
-                char recfm_str[16];
-                if ((info.recfm & RECFM_U) == RECFM_U) {
-                    snprintf(recfm_str, sizeof(recfm_str), "u");
-                } else if (info.recfm & RECFM_V) {
-                    snprintf(recfm_str, sizeof(recfm_str), (info.recfm & RECFM_B) ? "v,b" : "v");
-                } else {
-                    snprintf(recfm_str, sizeof(recfm_str), (info.recfm & RECFM_B) ? "f,b" : "f");
-                }
-
-                uint32_t lrecl = info.lrecl ? info.lrecl : 80;
-                uint32_t blksize = info.blksize ? info.blksize : 3120;
-
-                char alloc_cmd[256];
-                snprintf(alloc_cmd, sizeof(alloc_cmd),
-                         "alloc fi(RCVOUT) da('%s') new catalog tracks space(10,50) recfm(%s) lrecl(%u) blksize(%u)",
-                         target_dsn, recfm_str, lrecl, blksize);
-
-                log_verbose("Allocating target dataset: %s", alloc_cmd);
-                int rc = dynalloc_str(alloc_cmd, msg, sizeof(msg));
-                if (rc != 0) {
-                    log_error("Failed allocating target dataset '%s': %s (rc=%d)", target_dsn, msg, rc);
-                    return RC_ERR_ALLOC_TGT;
-                }
-                target_allocated = true;
-
-                /* Open target dataset */
-                out_fp = fopen("DD:RCVOUT", "wb,type=record");
-                if (!out_fp) {
-                    log_error("Failed to open DD:RCVOUT for dataset '%s': %s", target_dsn, strerror(errno));
-                    dynalloc_str("free fi(RCVOUT)", msg, sizeof(msg));
-                    return RC_ERR_ALLOC_TGT;
-                }
-            } else if (payload_len >= 6 && memcmp(payload, inmr06_eye, 6) == 0) {
-                log_verbose("Processing INMR06 trailer (end of transmission)");
-                stream_pos += seg_len;
-                break;
-            }
-        } else {
-            /* Data Record */
-            if (!out_fp) {
-                log_error("Encountered data segment before INMR02 dataset allocation");
-                return RC_ERR_STREAM;
-            }
-
-            if ((flags & 0xC0) == 0xC0) {
-                /* Complete unspanned logical record */
-                if (fwrite(payload, 1, payload_len, out_fp) != payload_len) {
-                    log_error("Failed writing record %zu to dataset", records_restored + 1);
-                    break;
-                }
-                records_restored++;
-            } else if (flags & 0x80) {
-                /* First segment of spanned record */
-                rec_assembly_len = 0;
-                if (payload_len < sizeof(rec_assembly)) {
-                    memcpy(rec_assembly, payload, payload_len);
-                    rec_assembly_len = payload_len;
-                }
-            } else {
-                /* Middle or last segment */
-                if (rec_assembly_len + payload_len < sizeof(rec_assembly)) {
-                    memcpy(rec_assembly + rec_assembly_len, payload, payload_len);
-                    rec_assembly_len += payload_len;
-                }
-                if (flags & 0x40) {
-                    /* Last segment of spanned record */
-                    if (fwrite(rec_assembly, 1, rec_assembly_len, out_fp) != rec_assembly_len) {
-                        log_error("Failed writing spanned record %zu to dataset", records_restored + 1);
-                        break;
-                    }
-                    records_restored++;
-                    rec_assembly_len = 0;
-                }
-            }
-        }
-
-        stream_pos += seg_len;
     }
 
-    if (out_fp) {
-        fclose(out_fp);
+    char msg[256];
+    if (state.out_fp) {
+        fclose(state.out_fp);
     }
-
-    if (target_allocated) {
+    if (state.target_allocated) {
         dynalloc_str("free fi(RCVOUT)", msg, sizeof(msg));
     }
 
-    log_info("Successfully restored %zu records to dataset %s", records_restored, target_dsn);
+    if (state.error_code != 0) {
+        return state.error_code;
+    }
+
+    log_info("Successfully restored %zu records to dataset %s", state.records_restored, state.target_dsn);
     return RC_SUCCESS;
 }

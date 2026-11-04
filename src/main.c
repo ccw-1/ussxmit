@@ -120,6 +120,13 @@ int main(int argc, char **argv)
                     log_error("Unexpected additional argument '%s'", arg);
                     return RC_ERR_SYNTAX;
                 }
+            } else if (opts.action == ACTION_INSPECT) {
+                if (opts.source_dsn[0] == '\0') {
+                    strncpy(opts.source_dsn, arg, sizeof(opts.source_dsn) - 1);
+                } else {
+                    log_error("Unexpected additional argument '%s'", arg);
+                    return RC_ERR_SYNTAX;
+                }
             } else {
                 log_error("Unexpected dataset argument for action");
                 return RC_ERR_SYNTAX;

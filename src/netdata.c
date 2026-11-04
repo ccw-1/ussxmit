@@ -59,29 +59,35 @@ void netdata_writer_init(netdata_writer_t *w, FILE *out_fp)
     memset(w->card_buf, 0x40, sizeof(w->card_buf));
 }
 
-int netdata_writer_put_segment(netdata_writer_t *w, uint8_t flags, const uint8_t *data, size_t len)
+int netdata_writer_emit_record(netdata_writer_t *w, bool is_control, const uint8_t *data, size_t len)
 {
-    if (!w || !w->out_fp || len > 253) return -1;
+    if (!w || !w->out_fp) return -1;
 
-    uint8_t seg_hdr[2];
-    seg_hdr[0] = (uint8_t)(len + 2);
-    seg_hdr[1] = flags;
-
-    /* Write 2-byte segment header across 80-byte card boundary */
-    for (int h = 0; h < 2; h++) {
-        w->card_buf[w->card_pos++] = seg_hdr[h];
-        if (w->card_pos == 80) {
+    if (len == 0) {
+        if (w->card_pos > 0 && w->card_pos + 2 > 80) {
             if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
             w->total_records_written++;
             w->total_bytes_written += 80;
             w->card_pos = 0;
             memset(w->card_buf, 0x40, sizeof(w->card_buf));
         }
+        w->card_buf[w->card_pos++] = 2;
+        w->card_buf[w->card_pos++] = is_control ? 0xE0 : 0xC0;
+        return 0;
     }
 
-    /* Write segment payload across 80-byte card boundary */
-    for (size_t i = 0; i < len; i++) {
-        w->card_buf[w->card_pos++] = data[i];
+    if (len <= 78) {
+        if (w->card_pos > 0 && w->card_pos + len + 2 > 80) {
+            if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
+            w->total_records_written++;
+            w->total_bytes_written += 80;
+            w->card_pos = 0;
+            memset(w->card_buf, 0x40, sizeof(w->card_buf));
+        }
+        w->card_buf[w->card_pos++] = (uint8_t)(len + 2);
+        w->card_buf[w->card_pos++] = is_control ? 0xE0 : 0xC0;
+        memcpy(w->card_buf + w->card_pos, data, len);
+        w->card_pos += len;
         if (w->card_pos == 80) {
             if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
             w->total_records_written++;
@@ -89,6 +95,47 @@ int netdata_writer_put_segment(netdata_writer_t *w, uint8_t flags, const uint8_t
             w->card_pos = 0;
             memset(w->card_buf, 0x40, sizeof(w->card_buf));
         }
+        return 0;
+    }
+
+    /* Spanned logical record (len > 78) */
+    if (w->card_pos > 0) {
+        if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
+        w->total_records_written++;
+        w->total_bytes_written += 80;
+        w->card_pos = 0;
+        memset(w->card_buf, 0x40, sizeof(w->card_buf));
+    }
+
+    size_t offset = 0;
+    bool first = true;
+    while (offset < len) {
+        size_t rem = len - offset;
+        size_t chunk = (rem > 78) ? 78 : rem;
+        bool last = (offset + chunk >= len);
+
+        uint8_t flags;
+        if (first) {
+            flags = is_control ? 0xA0 : 0x80;
+            first = false;
+        } else if (last) {
+            flags = is_control ? 0x60 : 0x40;
+        } else {
+            flags = is_control ? 0x20 : 0x00;
+        }
+
+        w->card_buf[0] = (uint8_t)(chunk + 2);
+        w->card_buf[1] = flags;
+        memcpy(w->card_buf + 2, data + offset, chunk);
+        memset(w->card_buf + 2 + chunk, 0x40, 80 - (2 + chunk));
+
+        if (fwrite(w->card_buf, 1, 80, w->out_fp) != 80) return -1;
+        w->total_records_written++;
+        w->total_bytes_written += 80;
+        w->card_pos = 0;
+        memset(w->card_buf, 0x40, sizeof(w->card_buf));
+
+        offset += chunk;
     }
 
     return 0;
@@ -170,7 +217,7 @@ int netdata_writer_emit_inmr01(netdata_writer_t *w, const char *node, const char
     write_u16_be(buf + off, 1);      off += 2;
     buf[off++] = 0x01;
 
-    return netdata_writer_put_segment(w, 0xE0, buf, off);
+    return netdata_writer_emit_record(w, true, buf, off);
 }
 
 int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize)
@@ -255,7 +302,7 @@ int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t ds
         }
     }
 
-    return netdata_writer_put_segment(w, 0xE0, buf, off);
+    return netdata_writer_emit_record(w, true, buf, off);
 }
 
 int netdata_writer_emit_inmr03(netdata_writer_t *w, uint16_t dsorg, uint8_t recfm, uint32_t lrecl)
@@ -286,46 +333,19 @@ int netdata_writer_emit_inmr03(netdata_writer_t *w, uint16_t dsorg, uint8_t recf
     write_u16_be(buf + off, 2);      off += 2;
     buf[off++] = 0x00; buf[off++] = (uint8_t)(recfm & 0x01);
 
-    return netdata_writer_put_segment(w, 0xE0, buf, off);
+    return netdata_writer_emit_record(w, true, buf, off);
 }
 
 int netdata_writer_emit_data(netdata_writer_t *w, const uint8_t *data, size_t len)
 {
-    if (!w || !data) return -1;
-
-    if (len <= 253) {
-        /* Single segment data record */
-        return netdata_writer_put_segment(w, 0xC0, data, len);
-    }
-
-    /* Spanned logical record */
-    size_t offset = 0;
-    bool first = true;
-
-    while (offset < len) {
-        size_t chunk = len - offset;
-        if (chunk > 253) chunk = 253;
-
-        bool last = (offset + chunk >= len);
-        uint8_t flags;
-        if (first && last)   flags = 0xC0;
-        else if (first)      flags = 0x80;
-        else if (last)       flags = 0x40;
-        else                 flags = 0x00;
-
-        if (netdata_writer_put_segment(w, flags, data + offset, chunk) != 0) return -1;
-        offset += chunk;
-        first = false;
-    }
-
-    return 0;
+    return netdata_writer_emit_record(w, false, data, len);
 }
 
 int netdata_writer_emit_inmr06(netdata_writer_t *w)
 {
     uint8_t buf[8];
     memcpy(buf, inmr06_eye, 6);
-    return netdata_writer_put_segment(w, 0xE0, buf, 6);
+    return netdata_writer_emit_record(w, true, buf, 6);
 }
 
 int netdata_writer_flush(netdata_writer_t *w)
@@ -348,7 +368,7 @@ int netdata_writer_flush(netdata_writer_t *w)
 /* Netdata Parser (RECEIVE / Inspect Decoder)                         */
 /* ================================================================== */
 
-static void parse_text_units(const uint8_t *p, size_t len, netdata_info_t *info, bool is_inmr02)
+void netdata_parse_text_units(const uint8_t *p, size_t len, netdata_info_t *info, bool is_inmr02)
 {
     size_t offset = 0;
 
@@ -443,41 +463,116 @@ static void parse_text_units(const uint8_t *p, size_t len, netdata_info_t *info,
     }
 }
 
+void netdata_reader_init(netdata_reader_t *r, netdata_record_cb_t cb, void *user_data)
+{
+    if (!r) return;
+    memset(r, 0, sizeof(*r));
+    r->record_cb = cb;
+    r->user_data = user_data;
+}
+
+int netdata_reader_feed_card(netdata_reader_t *r, const uint8_t card[80])
+{
+    if (!r || !card) return -1;
+    r->total_cards_read++;
+
+    size_t pos = 0;
+    while (pos + 2 <= 80) {
+        uint8_t seg_len = card[pos];
+        uint8_t flags   = card[pos + 1];
+
+        if (seg_len < 2 || pos + seg_len > 80) {
+            /* Remainder is padding */
+            break;
+        }
+
+        const uint8_t *seg_data = card + pos + 2;
+        size_t seg_data_len = seg_len - 2;
+
+        bool is_first = (flags & 0x80) != 0;
+        bool is_last  = (flags & 0x40) != 0;
+        bool is_ctl   = (flags & 0x20) != 0;
+
+        if (is_first) {
+            r->assembly_len = 0;
+            r->assembly_is_control = is_ctl;
+            r->in_spanned_record = !is_last;
+        }
+
+        if (r->assembly_len + seg_data_len <= sizeof(r->assembly_buf)) {
+            memcpy(r->assembly_buf + r->assembly_len, seg_data, seg_data_len);
+            r->assembly_len += seg_data_len;
+        }
+
+        if (is_last) {
+            r->in_spanned_record = false;
+            r->total_records_dispatched++;
+            if (r->record_cb) {
+                int rc = r->record_cb(r->assembly_is_control, r->assembly_buf, r->assembly_len, r->user_data);
+                if (rc != 0) return rc;
+            }
+            r->assembly_len = 0;
+        }
+
+        pos += seg_len;
+        if (pos >= 80 || card[pos] == 0x00 || card[pos] == 0x40) {
+            break;
+        }
+    }
+
+    return 0;
+}
+
+int netdata_reader_feed(netdata_reader_t *r, const uint8_t *buf, size_t len)
+{
+    if (!r || !buf) return -1;
+    size_t offset = 0;
+    while (offset + 80 <= len) {
+        int rc = netdata_reader_feed_card(r, buf + offset);
+        if (rc != 0) return rc;
+        offset += 80;
+    }
+    return 0;
+}
+
+static int header_parse_cb(bool is_control, const uint8_t *data, size_t len, void *user_data)
+{
+    netdata_info_t *info = (netdata_info_t *)user_data;
+    if (!is_control || len < 6) return 0;
+
+    if (memcmp(data, inmr01_eye, 6) == 0) {
+        info->has_inmr01 = true;
+        if (len > 6) {
+            netdata_parse_text_units(data + 6, len - 6, info, false);
+        }
+    } else if (memcmp(data, inmr02_eye, 6) == 0) {
+        info->has_inmr02 = true;
+        if (len > 10) {
+            netdata_parse_text_units(data + 10, len - 10, info, true);
+        }
+    } else if (memcmp(data, inmr06_eye, 6) == 0) {
+        return 1; /* Stop on trailer */
+    }
+
+    return 0;
+}
+
 int netdata_parse_header(const uint8_t *buffer, size_t buflen, netdata_info_t *info)
 {
     if (!buffer || buflen < 80 || !info) return -1;
     memset(info, 0, sizeof(*info));
 
+    netdata_reader_t reader;
+    netdata_reader_init(&reader, header_parse_cb, info);
+
     size_t offset = 0;
-
-    while (offset + 2 <= buflen) {
-        uint8_t seg_len = buffer[offset];
-        uint8_t flags   = buffer[offset + 1];
-
-        if (seg_len < 2) break;
-        if (offset + seg_len > buflen) break;
-
-        const uint8_t *payload = buffer + offset + 2;
-        size_t payload_len = seg_len - 2;
-
-        /* Control segment if flags & 0x20 != 0 */
-        if ((flags & 0x20) != 0 && payload_len >= 6) {
-            if (memcmp(payload, inmr01_eye, 6) == 0) {
-                info->has_inmr01 = true;
-                if (payload_len > 6) {
-                    parse_text_units(payload + 6, payload_len - 6, info, false);
-                }
-            } else if (memcmp(payload, inmr02_eye, 6) == 0) {
-                info->has_inmr02 = true;
-                if (payload_len > 10) {
-                    parse_text_units(payload + 10, payload_len - 10, info, true);
-                }
-            } else if (memcmp(payload, inmr06_eye, 6) == 0) {
-                break;
-            }
+    while (offset + 80 <= buflen) {
+        int rc = netdata_reader_feed_card(&reader, buffer + offset);
+        if (rc > 0 || (info->has_inmr01 && info->has_inmr02)) {
+            break;
         }
-
-        offset += seg_len;
+        if (rc < 0) return -1;
+        offset += 80;
     }
 
     return (info->has_inmr01 && info->has_inmr02) ? 0 : -1;
