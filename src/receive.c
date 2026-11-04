@@ -114,7 +114,7 @@ int do_receive(const ussxmit_opts_t *opts)
              "//SYSTSPRT DD SYSOUT=*\n"
              "//SYSTSIN DD *\n"
              "  RECEIVE INDSNAME('%s')\n"
-             "  RESTORE DATASET('%s')\n"
+             "  DATASET('%s')\n"
              "/*\n",
              jobname, temp_dsn, target_dsn);
 
