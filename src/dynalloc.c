@@ -359,13 +359,7 @@ int dynalloc_delete_dsn(const char *dsn)
 {
     char cmd[128];
     char msg[128];
-    snprintf(cmd, sizeof(cmd), "delete('%s')", dsn);
+    snprintf(cmd, sizeof(cmd), "alloc da('%s') old delete", dsn);
     log_verbose("dynalloc: %s", cmd);
-    int rc = dynalloc_str(cmd, msg, sizeof(msg));
-    if (rc != 0) {
-        /* Also attempt uncatalog / delete via IDCAMS / free delete */
-        snprintf(cmd, sizeof(cmd), "free da('%s') delete", dsn);
-        dynalloc_str(cmd, msg, sizeof(msg));
-    }
-    return rc;
+    return dynalloc_str(cmd, msg, sizeof(msg));
 }
