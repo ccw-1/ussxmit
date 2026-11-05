@@ -10,6 +10,7 @@ void log_set_quiet(bool quiet);
 
 void log_info(const char *fmt, ...);
 void log_verbose(const char *fmt, ...);
+void log_warn(const char *fmt, ...);
 void log_error(const char *fmt, ...);
 
 /* EBCDIC / ASCII Code page conversion helpers */

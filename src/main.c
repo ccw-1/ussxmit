@@ -60,31 +60,8 @@ int main(int argc, char **argv)
         opts.action = ACTION_RECEIVE;
     }
 
-    int arg_idx = 1;
-
-    /* Parse action if not determined from executable name */
-    if (opts.action == ACTION_UNKNOWN && arg_idx < argc) {
-        if (strcmp(argv[arg_idx], "xmit") == 0) {
-            opts.action = ACTION_XMIT;
-            arg_idx++;
-        } else if (strcmp(argv[arg_idx], "receive") == 0) {
-            opts.action = ACTION_RECEIVE;
-            arg_idx++;
-        } else if (strcmp(argv[arg_idx], "inspect") == 0) {
-            opts.action = ACTION_INSPECT;
-            arg_idx++;
-        } else if (strcmp(argv[arg_idx], "-h") == 0 || strcmp(argv[arg_idx], "--help") == 0) {
-            print_usage(prog);
-            return RC_SUCCESS;
-        } else if (strcmp(argv[arg_idx], "-V") == 0 || strcmp(argv[arg_idx], "--version") == 0) {
-            printf("ussxmit version %s\n", USSXMIT_VERSION);
-            return RC_SUCCESS;
-        }
-    }
-
-    /* Parse options and dataset arguments */
-    while (arg_idx < argc) {
-        const char *arg = argv[arg_idx];
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
 
         if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             opts.verbose = true;
@@ -104,9 +81,21 @@ int main(int argc, char **argv)
             log_error("Unknown option '%s'", arg);
             print_usage(prog);
             return RC_ERR_SYNTAX;
+        } else if (opts.action == ACTION_UNKNOWN) {
+            if (strcmp(arg, "xmit") == 0) {
+                opts.action = ACTION_XMIT;
+            } else if (strcmp(arg, "receive") == 0) {
+                opts.action = ACTION_RECEIVE;
+            } else if (strcmp(arg, "inspect") == 0) {
+                opts.action = ACTION_INSPECT;
+            } else {
+                log_error("Unknown action '%s' (expected 'xmit', 'receive', or 'inspect')", arg);
+                print_usage(prog);
+                return RC_ERR_SYNTAX;
+            }
         } else {
-            /* Positional dataset name */
-            if (opts.action == ACTION_XMIT) {
+            /* Positional dataset name based on action */
+            if (opts.action == ACTION_XMIT || opts.action == ACTION_INSPECT) {
                 if (opts.source_dsn[0] == '\0') {
                     strncpy(opts.source_dsn, arg, sizeof(opts.source_dsn) - 1);
                 } else {
@@ -120,19 +109,8 @@ int main(int argc, char **argv)
                     log_error("Unexpected additional argument '%s'", arg);
                     return RC_ERR_SYNTAX;
                 }
-            } else if (opts.action == ACTION_INSPECT) {
-                if (opts.source_dsn[0] == '\0') {
-                    strncpy(opts.source_dsn, arg, sizeof(opts.source_dsn) - 1);
-                } else {
-                    log_error("Unexpected additional argument '%s'", arg);
-                    return RC_ERR_SYNTAX;
-                }
-            } else {
-                log_error("Unexpected dataset argument for action");
-                return RC_ERR_SYNTAX;
             }
         }
-        arg_idx++;
     }
 
     log_set_verbose(opts.verbose);

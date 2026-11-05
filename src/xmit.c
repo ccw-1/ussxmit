@@ -9,6 +9,7 @@
 
 #include "ussxmit.h"
 #include "netdata.h"
+#include "pds_xmit.h"
 #include "dynalloc.h"
 #include "utils.h"
 
@@ -73,6 +74,12 @@ int do_xmit(const ussxmit_opts_t *opts)
     /* Initialize Netdata stream writer to STDOUT */
     netdata_writer_t writer;
     netdata_writer_init(&writer, stdout);
+
+    if (dsorg == DSORG_PO) {
+        fclose(fp);
+        dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
+        return xmit_pds_stream(opts, src_dsn, dsorg, recfm, lrecl, blksize, &writer);
+    }
 
     /* Emit INMR01 Transmission Header */
     if (netdata_writer_emit_inmr01(&writer, "POK", get_current_hlq()) != 0) {

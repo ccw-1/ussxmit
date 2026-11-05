@@ -31,6 +31,15 @@ $BIN xmit "CCW.TESTSEQ" | $BIN receive -f "CCW.TESTSEQ.INTTEST"
 echo "Test 5: Verify restored dataset via re-xmit pipeline"
 $BIN xmit "CCW.TESTSEQ.INTTEST" | $BIN inspect | grep "Dataset Name : CCW.TESTSEQ.INTTEST"
 
+# 6. Pipeline streaming PDS: xmit -> receive
+echo "Test 6: Streaming PDS pipeline: xmit -> receive"
+$BIN xmit "CCW.TESTPDS" | $BIN receive -f "CCW.TESTPDS.INTTEST"
+
+# 7. Verify restored PDS dataset via re-xmit pipeline
+echo "Test 7: Verify restored PDS dataset via re-xmit pipeline"
+$BIN xmit "CCW.TESTPDS.INTTEST" | $BIN inspect | grep "Dataset Name : CCW.TESTPDS.INTTEST"
+$BIN xmit "CCW.TESTPDS.INTTEST" | $BIN inspect | grep "Organization : PO (Partitioned)"
+
 echo ""
 echo "=================================================="
 echo " All Integration Tests Passed Successfully!"

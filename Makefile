@@ -10,6 +10,7 @@ OBJDIR = obj
 
 SRCS = $(SRCDIR)/main.c \
        $(SRCDIR)/xmit.c \
+       $(SRCDIR)/pds_xmit.c \
        $(SRCDIR)/receive.c \
        $(SRCDIR)/inspect.c \
        $(SRCDIR)/netdata.c \

@@ -37,6 +37,17 @@ void log_verbose(const char *fmt, ...)
     fprintf(stderr, "\n");
 }
 
+void log_warn(const char *fmt, ...)
+{
+    if (g_quiet) return;
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "ussxmit: warning: ");
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+}
+
 void log_error(const char *fmt, ...)
 {
     va_list ap;
