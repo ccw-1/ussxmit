@@ -142,10 +142,19 @@ graph TD
 2. Calls `dynalloc_str("alloc fi(XMITIN) da('...') shr")` to dynamically allocate the dataset via SVC 6 `BPXWDYN`.
 3. Opens the dataset using `fopen("DD:XMITIN", "rb,type=record")` for native binary record I/O.
 4. Queries dataset characteristics using `fldata()` to extract `dsorg`, `recfm`, `maxreclen`, and `blksize`.
-5. Initializes `netdata_writer_t` bound to `stdout`.
-6. Emits `INMR01` transmission header and `INMR02` dataset attribute records.
-7. Reads physical records sequentially via `fread()` and emits Netdata data records. Records longer than 253 bytes are automatically spanned across continuous segments with `0x80`/`0x00`/`0x40` flags.
-8. Emits `INMR06` trailer record, flushes the writer to pad the final 80-byte physical card, and closes/frees the DD.
+5. **Sequential Datasets (`DSORG=PS`)**:
+   - Emits `INMR01` and `INMR02` (`INMUTILN = INMCOPY`).
+   - Reads records sequentially via `fread()` and emits Netdata data records (spanned if >253 bytes).
+   - Emits `INMR06` trailer, flushes, and frees DD.
+6. **Partitioned Datasets (`DSORG=PO` — PDS & PDSE)** ([`src/pds_xmit.c`](src/pds_xmit.c:1)):
+   - Reads 256-byte directory blocks from `fopen("DD:PDSDIR", "rb,type=record")`.
+   - Parses member entries, TTRs, user data (ISPF stats, program object metadata), and ALIAS flags (`C & 0x80`).
+   - Probes the first member via `fldata()` to extract exact dataset `RECFM`, `LRECL`, and `BLKSIZE`.
+   - Emits `INMR01` and `INMR02` (`INMUTILN = IEBCOPY`, `INMDSORG = 0x0200`).
+   - Emits `COPYR1` header record (56 bytes, `00 CA 6D 0F...`) with 3390 track geometry.
+   - Emits directory header block (276 bytes) and directory blocks (288 bytes each).
+   - Streams member physical data blocks wrapped in 12-byte CKD headers `[0x00000000][CCHH][TTR_R][len]`, terminated with a 12-byte member EOF marker (`len = 0`). Aliases are preserved in directory blocks and skipped during physical data block emission.
+   - Emits `INMR06` trailer, flushes, and frees DDs.
 
 ### 4.2. `receive` Operation
 1. Initializes `netdata_reader_t` with record dispatcher callback `receive_record_cb`.
@@ -155,10 +164,14 @@ graph TD
    - Decodes text units (`INMDSNAM`, `INMDSORG`, `INMRECFM`, `INMLRECL`, `INMBLKSIZE`, `INMDIR`).
    - Resolves target dataset name (command-line override or embedded dataset name).
    - If `-f` / `--force` specified, invokes `dynalloc_delete_dsn()` to delete existing cataloged dataset.
-   - Dynamically allocates target dataset via `BPXWDYN` with matching attributes.
-   - Opens target via `fopen("DD:RCVOUT", "wb,type=record")`.
-5. On data records: writes records directly to target dataset via `fwrite()`.
-6. On `INMR06`: closes target dataset and frees DD.
+   - Dynamically allocates target dataset via `BPXWDYN` (adding `dir(...)` for PDS).
+5. **Sequential Restoration (`DSORG=PS`)**:
+   - Opens target via `fopen("DD:RCVOUT", "wb,type=record")` and writes records directly.
+6. **Partitioned Restoration (`DSORG=PO`)** ([`src/receive.c`](src/receive.c:1)):
+   - Identifies `COPYR1` and directory records (276/288 bytes) and extracts member queue.
+   - For each CKD block: allocates `alloc fi(RCVMEM) da('TARGET(MEM)') shr`, writes data blocks via `fopen("DD:RCVMEM", "wb,type=record")`.
+   - On 12-byte EOF block (`len = 0`): closes member file, frees DD, and advances to next member.
+7. On `INMR06`: closes all open handles and frees allocated DDs.
 
 ### 4.3. `inspect` Operation
 1. Accepts input from an MVS dataset name (e.g. `ussxmit inspect "CCW.TESTPDS.XMI"`), a local file, or `stdin`.

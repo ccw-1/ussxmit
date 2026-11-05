@@ -18,6 +18,7 @@ ussxmit/
 ├── src/
 │   ├── main.c              # CLI argument parser and action dispatcher
 │   ├── xmit.c              # Pure in-process XMIT streaming engine
+│   ├── pds_xmit.c          # In-process PDS/PDSE IEBCOPY unload engine
 │   ├── receive.c           # Pure in-process RECEIVE streaming engine
 │   ├── inspect.c           # Archive inspection & metadata display
 │   ├── netdata.c           # Netdata stream writer, reader, and text units
@@ -59,6 +60,14 @@ ussxmit/
 - [x] Verify live streaming pipeline: `ussxmit xmit "CCW.TESTSEQ" | ussxmit receive -f "CCW.TESTSEQ.INTTEST"` with byte-for-byte fidelity.
 - [x] Update documentation in [`README.md`](README.md:1), [`DESIGN.md`](DESIGN.md:1), and [`PLAN.md`](PLAN.md:1).
 
+### Milestone 6: In-Process PDS & PDSE Streaming Unload and Restore Engine ✅
+- [x] Implement in-process directory parsing for PDS & PDSE containers in [`src/pds_xmit.c`](src/pds_xmit.c:1).
+- [x] Implement standard IEBCOPY unloaded data stream generator (`COPYR1` header, 276-byte directory header, 288-byte directory blocks, 12-byte CKD member blocks).
+- [x] Implement dynamic attribute probe on first member to refine `RECFM`, `LRECL`, and `BLKSIZE` for partitioned datasets.
+- [x] Support `ALIAS` member preservation in directory blocks while skipping duplicate physical data block emission.
+- [x] Implement in-process PDS/PDSE restoration in [`src/receive.c`](src/receive.c:1) with automatic container and member DD management.
+- [x] Verify end-to-end PDS streaming and restore on `pok56` with byte fidelity (`CCW.TESTPDS` -> `CCW.TESTPDS.INTTEST` and `CCW.GO.PDSE`).
+
 ---
 
 ## 3. Build & Compilation Strategy
@@ -84,3 +93,6 @@ CFLAGS ?= -O2 -fzos-le-char-mode=ascii -D_EXT -D_XOPEN_SOURCE_EXTENDED=1 -I./inc
 | Streaming Pipeline (XMIT -> Inspect) | `ussxmit xmit "CCW.TESTSEQ" \| ussxmit inspect` | Passed ✅ |
 | Streaming Pipeline (XMIT -> Receive) | `ussxmit xmit "CCW.TESTSEQ" \| ussxmit receive -f ...` | Passed ✅ |
 | Restored Dataset Integrity | Re-xmit & inspect restored dataset | Passed ✅ |
+| PDS Streaming Pipeline (XMIT -> Receive) | `ussxmit xmit "CCW.TESTPDS" \| ussxmit receive -f ...` | Passed ✅ |
+| Restored PDS Member Integrity | Re-xmit & verify members (`MBR1`, `MBR2`) | Passed ✅ |
+| PDSE GOFF Program Object Stream | `ussxmit xmit "CCW.GO.PDSE" \| ussxmit inspect` | Passed ✅ |
