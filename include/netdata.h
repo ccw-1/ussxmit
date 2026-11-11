@@ -77,6 +77,8 @@ void netdata_writer_init(netdata_writer_t *w, FILE *out_fp);
 int  netdata_writer_emit_record(netdata_writer_t *w, bool is_control, const uint8_t *data, size_t len);
 int  netdata_writer_emit_inmr01(netdata_writer_t *w, const char *node, const char *user);
 int  netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize, uint64_t size_bytes, uint32_t dir_blocks);
+/* Full form: utility is "INMCOPY" or "IEBCOPY"; dsn may be NULL (second INMR02 of a PDS stream) */
+int  netdata_writer_emit_inmr02_ex(netdata_writer_t *w, const char *utility, const char *dsn, uint16_t dsorg, uint8_t recfm, uint8_t recfm2, uint32_t lrecl, uint32_t blksize, uint64_t size_bytes, uint32_t dir_blocks);
 int  netdata_writer_emit_inmr03(netdata_writer_t *w, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint64_t size_bytes);
 int  netdata_writer_emit_data(netdata_writer_t *w, const uint8_t *data, size_t len);
 int  netdata_writer_emit_inmr06(netdata_writer_t *w);

@@ -66,6 +66,9 @@ int do_xmit(const ussxmit_opts_t *opts)
     uint32_t lrecl = (uint32_t)info.__maxreclen;
     uint32_t blksize = (uint32_t)info.__blksize;
     if (lrecl == 0) lrecl = 80;
+    /* fldata() reports the data length of variable records; the DCB LRECL
+     * that TRANSMIT sends includes the 4-byte record descriptor word. */
+    if ((recfm & RECFM_V) && (recfm & RECFM_U) != RECFM_U) lrecl += 4;
     if (blksize == 0) blksize = lrecl;
 
     log_verbose("Dataset attributes: DSORG=0x%04X, RECFM=0x%02X, LRECL=%u, BLKSIZE=%u",
@@ -104,6 +107,14 @@ int do_xmit(const ussxmit_opts_t *opts)
     /* Emit INMR02 Dataset Utility / Attributes */
     if (netdata_writer_emit_inmr02(&writer, src_dsn, dsorg, recfm, lrecl, blksize, size_bytes, 0) != 0) {
         log_error("Failed to emit INMR02 record");
+        fclose(fp);
+        dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
+        return RC_ERR_STREAM;
+    }
+
+    /* INMR03 describes the transmitted data records (as TRANSMIT does: DSORG PS, LRECL 80, RECFM 1) */
+    if (netdata_writer_emit_inmr03(&writer, DSORG_PS, 0x01, 80, size_bytes) != 0) {
+        log_error("Failed to emit INMR03 record");
         fclose(fp);
         dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
         return RC_ERR_STREAM;

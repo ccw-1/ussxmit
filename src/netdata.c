@@ -252,9 +252,9 @@ int netdata_writer_emit_inmr01(netdata_writer_t *w, const char *node, const char
     return netdata_writer_emit_record(w, true, buf, off);
 }
 
-int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize, uint64_t size_bytes, uint32_t dir_blocks)
+int netdata_writer_emit_inmr02_ex(netdata_writer_t *w, const char *utility, const char *dsn, uint16_t dsorg, uint8_t recfm, uint8_t recfm2, uint32_t lrecl, uint32_t blksize, uint64_t size_bytes, uint32_t dir_blocks)
 {
-    uint8_t buf[256];
+    uint8_t buf[320];
     size_t off = 0;
 
     /* 6-byte eyecatcher INMR02 */
@@ -265,13 +265,16 @@ int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t ds
     write_u32_be(buf + off, 1);
     off += 4;
 
-    /* TU 0x1028: Utility Name (INMCOPY) */
-    char util[16] = "INMCOPY";
+    /* TU 0x1028: Utility Name (INMCOPY or IEBCOPY) */
+    char util[16];
+    strncpy(util, utility, sizeof(util) - 1);
+    util[sizeof(util) - 1] = '\0';
+    size_t ulen = strlen(util);
     a2e_str(util);
     write_u16_be(buf + off, 0x1028); off += 2;
     write_u16_be(buf + off, 1);      off += 2;
-    write_u16_be(buf + off, 7);      off += 2;
-    memcpy(buf + off, util, 7); off += 7;
+    write_u16_be(buf + off, (uint16_t)ulen); off += 2;
+    memcpy(buf + off, util, ulen); off += ulen;
 
     /* TU 0x102C: INMSIZE, approximate file size in bytes (0 = unknown) */
     off += write_inmsize_tu(buf + off, size_bytes);
@@ -299,16 +302,24 @@ int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t ds
     write_u16_be(buf + off, 4);      off += 2;
     write_u32_be(buf + off, blksize ? blksize : lrecl); off += 4;
 
-    /* TU 0x0049: RECFM (2 bytes: recfm flags + 0x02) */
+    /* TU 0x0049: RECFM (2 bytes) */
     write_u16_be(buf + off, 0x0049); off += 2;
     write_u16_be(buf + off, 1);      off += 2;
     write_u16_be(buf + off, 2);      off += 2;
     buf[off++] = recfm;
-    buf[off++] = 0x02;
+    buf[off++] = recfm2;
 
-    /* TU 0x0002: INMDSNAM (split qualifiers) */
-    char norm_dsn[64];
-    dsn_normalize(norm_dsn, sizeof(norm_dsn), dsn);
+    /* TU 0x8012: INMTYPE (1 byte, 0 = data library) accompanies IEBCOPY */
+    if (strcmp(utility, "IEBCOPY") == 0) {
+        write_u16_be(buf + off, 0x8012); off += 2;
+        write_u16_be(buf + off, 1);      off += 2;
+        write_u16_be(buf + off, 1);      off += 2;
+        buf[off++] = 0x00;
+    }
+
+    /* TU 0x0002: INMDSNAM (split qualifiers); omitted when dsn is NULL */
+    char norm_dsn[64] = "";
+    if (dsn) dsn_normalize(norm_dsn, sizeof(norm_dsn), dsn);
 
     char *quals[16];
     int qcnt = 0;
@@ -337,6 +348,11 @@ int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t ds
     }
 
     return netdata_writer_emit_record(w, true, buf, off);
+}
+
+int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize, uint64_t size_bytes, uint32_t dir_blocks)
+{
+    return netdata_writer_emit_inmr02_ex(w, "INMCOPY", dsn, dsorg, recfm, 0x00, lrecl, blksize, size_bytes, dir_blocks);
 }
 
 int netdata_writer_emit_inmr03(netdata_writer_t *w, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint64_t size_bytes)

@@ -29,8 +29,18 @@ static const uint8_t inmr06_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF6};
 typedef struct {
     char    name_ascii[9];
     uint8_t name_ebcdic[8];
+    uint8_t ttr[3];            /* directory TTR: relative track and record of the first block */
     bool    is_alias;
+    bool    done;
 } recv_member_t;
+
+#define RECV_MAX_EXTENTS 16
+
+typedef struct {
+    uint32_t cyl, head, ntracks;
+} recv_extent_t;
+
+enum { PDS_PHASE_COPYR1 = 0, PDS_PHASE_COPYR2, PDS_PHASE_DIR, PDS_PHASE_DATA };
 
 typedef struct {
     const ussxmit_opts_t *opts;
@@ -45,9 +55,19 @@ typedef struct {
     /* PDS / PDSE specific state */
     bool                  is_pds;
     bool                  seen_copyr1;
+    int                   pds_phase;        /* PDS_PHASE_* : COPYR1, COPYR2, directory, member data */
+    uint8_t               hdr_buf[12];      /* member data stream decoder state */
+    size_t                blk_kl;           /* key length of the unit being collected (directory blocks) */
+    size_t                hdr_have;
+    uint8_t               blk_buf[65536];
+    size_t                blk_need;
+    size_t                blk_have;
     recv_member_t         members[MAX_RECV_MEMBERS];
     size_t                member_count;
-    size_t                current_member_idx;
+    int                   cur_member;       /* member the data stream is in, -1 between members */
+    uint32_t              heads;            /* tracks per cylinder of the unloaded volume */
+    recv_extent_t         extents[RECV_MAX_EXTENTS];
+    size_t                extent_count;
     FILE                 *out_mem_fp;
     bool                  mem_allocated;
     size_t                members_restored;
@@ -96,11 +116,8 @@ static int open_member_for_writing(receive_state_t *st, const char *mbr_name)
     return 0;
 }
 
-static void parse_pds_directory_record(receive_state_t *st, const uint8_t *data, size_t len)
+static void parse_pds_directory_block(receive_state_t *st, const uint8_t *dirblk, size_t blk_avail)
 {
-    if (len < 20) return;
-    const uint8_t *dirblk = data + 20;
-    size_t blk_avail = len - 20;
     if (blk_avail < 2) return;
 
     uint16_t used = (dirblk[0] << 8) | dirblk[1];
@@ -114,6 +131,7 @@ static void parse_pds_directory_record(receive_state_t *st, const uint8_t *data,
         recv_member_t *m = &st->members[st->member_count];
         memset(m, 0, sizeof(*m));
         memcpy(m->name_ebcdic, dirblk + off, 8);
+        memcpy(m->ttr, dirblk + off + 8, 3);
         uint8_t c = dirblk[off + 11];
         m->is_alias = (c & 0x80) != 0;
 
@@ -138,78 +156,190 @@ static void parse_pds_directory_record(receive_state_t *st, const uint8_t *data,
     }
 }
 
-static int process_pds_ckd_data(receive_state_t *st, const uint8_t *data, size_t len)
+/* Write one physical block of a member as the logical records it holds.
+ * Unloaded members carry whole DASD blocks: fixed blocks are cut into LRECL
+ * records, variable blocks are decoded from their BDW/RDW, undefined blocks
+ * are one record. */
+static int write_member_block(receive_state_t *st, const uint8_t *blk, size_t len)
 {
-    /* Check for COPYR1 header (56 bytes, 00 CA 6D 0F ...) */
-    if (len == 56 && data[1] == 0xCA && data[2] == 0x6D && data[3] == 0x0F) {
-        log_verbose("Received IEBCOPY COPYR1 header");
-        st->seen_copyr1 = true;
-        return 0;
-    }
-
-    /* Check for Directory header / block records (276 or 288 bytes) */
-    if (len == 276 || len == 288) {
-        log_verbose("Processing IEBCOPY directory record (len=%zu)", len);
-        parse_pds_directory_record(st, data, len);
-        return 0;
-    }
-
-    /* Process CKD member data blocks */
-    size_t off = 0;
-    while (off + 12 <= len) {
-        uint32_t block_len = ((uint32_t)data[off + 9] << 16) |
-                             ((uint32_t)data[off + 10] << 8) |
-                             (uint32_t)data[off + 11];
-        off += 12;
-
-        if (block_len > 0) {
-            if (off + block_len > len) {
-                block_len = len - off;
+    if (!st->out_mem_fp) {
+        if (st->cur_member >= 0) {
+            const char *mname = st->members[st->cur_member].name_ascii;
+            if (open_member_for_writing(st, mname) != 0) {
+                return -1;
             }
-
-            if (!st->out_mem_fp) {
-                if (st->current_member_idx < st->member_count) {
-                    const char *mname = st->members[st->current_member_idx].name_ascii;
-                    if (open_member_for_writing(st, mname) != 0) {
-                        return -1;
-                    }
-                } else {
-                    log_warn("Received CKD block without active member in directory");
-                }
-            }
-
-            if (st->out_mem_fp) {
-                /* A real IEBCOPY unload holds whole blocks; record I/O takes one
-                 * fixed-length record per write, so split them. Our own streams
-                 * carry one record per block and pass through unchanged. */
-                size_t chunk = block_len;
-                if ((st->info.recfm & RECFM_U) != RECFM_U && !(st->info.recfm & RECFM_V) &&
-                    st->info.lrecl > 0 && block_len > st->info.lrecl) {
-                    chunk = st->info.lrecl;
-                }
-                for (size_t done = 0; done < block_len; done += chunk) {
-                    size_t n = (block_len - done < chunk) ? block_len - done : chunk;
-                    if (fwrite(data + off + done, 1, n, st->out_mem_fp) != n) {
-                        log_error("Failed writing member block");
-                        st->error_code = RC_ERR_STREAM;
-                        return -1;
-                    }
-                    st->records_restored++;
-                }
-            }
-            off += block_len;
         } else {
-            /* EOF for current member */
-            log_verbose("Completed member '%s'",
-                        (st->current_member_idx < st->member_count) ?
-                        st->members[st->current_member_idx].name_ascii : "unknown");
-            close_current_member(st);
-            st->members_restored++;
-            st->current_member_idx++;
+            log_warn("Received CKD block without active member in directory");
+            return 0;
         }
     }
 
+    if ((st->info.recfm & RECFM_U) == RECFM_U) {
+        if (fwrite(blk, 1, len, st->out_mem_fp) != len) goto fail;
+        st->records_restored++;
+    } else if (st->info.recfm & RECFM_V) {
+        size_t bdw = len >= 4 ? (((size_t)blk[0] << 8) | blk[1]) : 0;
+        if (bdw > len) bdw = len;
+        size_t p = 4;
+        while (p + 4 <= bdw) {
+            size_t rdw = ((size_t)blk[p] << 8) | blk[p + 1];
+            if (rdw < 4 || p + rdw > bdw) break;
+            if (fwrite(blk + p + 4, 1, rdw - 4, st->out_mem_fp) != rdw - 4) goto fail;
+            st->records_restored++;
+            p += rdw;
+        }
+    } else {
+        size_t reclen = st->info.lrecl > 0 ? st->info.lrecl : len;
+        for (size_t done = 0; done < len; done += reclen) {
+            size_t n = (len - done < reclen) ? len - done : reclen;
+            if (fwrite(blk + done, 1, n, st->out_mem_fp) != n) goto fail;
+            st->records_restored++;
+        }
+    }
     return 0;
+
+fail:
+    log_error("Failed writing member block");
+    st->error_code = RC_ERR_STREAM;
+    return -1;
+}
+
+/* Find the member whose data starts with the block header h: its CCHHR is
+ * turned into a relative track through the extents of COPYR2 and compared with
+ * the directory TTRs; without a match the next member in directory order is used. */
+static int select_member(receive_state_t *st, const uint8_t *h)
+{
+    uint64_t pos = ((uint64_t)((h[4] << 8) | h[5])) * st->heads + ((h[6] << 8) | h[7]);
+    uint32_t base = 0;
+    bool mapped = false;
+    uint32_t tt = 0;
+    for (size_t e = 0; e < st->extent_count; e++) {
+        uint64_t start = (uint64_t)st->extents[e].cyl * st->heads + st->extents[e].head;
+        if (pos >= start && pos - start < st->extents[e].ntracks) {
+            tt = base + (uint32_t)(pos - start);
+            mapped = true;
+            break;
+        }
+        base += st->extents[e].ntracks;
+    }
+    if (mapped) {
+        for (size_t i = 0; i < st->member_count; i++) {
+            const recv_member_t *m = &st->members[i];
+            if (!m->done && m->ttr[0] == (uint8_t)(tt >> 8) && m->ttr[1] == (uint8_t)tt && m->ttr[2] == h[8]) {
+                return (int)i;
+            }
+        }
+    }
+    for (size_t i = 0; i < st->member_count; i++) {
+        if (!st->members[i].done) return (int)i;
+    }
+    return -1;
+}
+
+/* Consume the member data stream: [12-byte header][block] units, which a
+ * logical record boundary may cut anywhere. A zero-length header ends a member. */
+static int process_member_bytes(receive_state_t *st, const uint8_t *p, size_t len)
+{
+    while (len > 0) {
+        if (st->blk_need == 0) {
+            size_t n = 12 - st->hdr_have;
+            if (n > len) n = len;
+            memcpy(st->hdr_buf + st->hdr_have, p, n);
+            st->hdr_have += n;
+            p += n;
+            len -= n;
+            if (st->hdr_have < 12) break;
+            st->hdr_have = 0;
+            if (st->pds_phase == PDS_PHASE_DIR) {
+                /* directory unit: count field with KL (byte 9) and DL (bytes 10-11); all zero ends it */
+                size_t kl = st->hdr_buf[9];
+                size_t dl = ((size_t)st->hdr_buf[10] << 8) | st->hdr_buf[11];
+                if (kl == 0 && dl == 0) {
+                    st->pds_phase = PDS_PHASE_DATA;
+                } else {
+                    st->blk_kl = kl;
+                    st->blk_need = kl + dl;
+                    st->blk_have = 0;
+                }
+                continue;
+            }
+
+            if (st->cur_member < 0) {
+                st->cur_member = select_member(st, st->hdr_buf);
+            }
+
+            size_t block_len = ((size_t)st->hdr_buf[9] << 16) | ((size_t)st->hdr_buf[10] << 8) | st->hdr_buf[11];
+            if (block_len == 0) {
+                log_verbose("Completed member '%s'",
+                            st->cur_member >= 0 ? st->members[st->cur_member].name_ascii : "unknown");
+                close_current_member(st);
+                st->members_restored++;
+                if (st->cur_member >= 0) st->members[st->cur_member].done = true;
+                st->cur_member = -1;
+            } else {
+                if (block_len > sizeof(st->blk_buf)) {
+                    log_error("Member block of %zu bytes exceeds buffer", block_len);
+                    st->error_code = RC_ERR_STREAM;
+                    return -1;
+                }
+                st->blk_need = block_len;
+                st->blk_have = 0;
+            }
+        } else {
+            size_t n = st->blk_need - st->blk_have;
+            if (n > len) n = len;
+            memcpy(st->blk_buf + st->blk_have, p, n);
+            st->blk_have += n;
+            p += n;
+            len -= n;
+            if (st->blk_have == st->blk_need) {
+                size_t blen = st->blk_need;
+                st->blk_need = 0;
+                if (st->pds_phase == PDS_PHASE_DIR) {
+                    log_verbose("Processing IEBCOPY directory block");
+                    parse_pds_directory_block(st, st->blk_buf + st->blk_kl, blen - st->blk_kl);
+                    continue;
+                }
+                if (write_member_block(st, st->blk_buf, blen) != 0) return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int process_pds_ckd_data(receive_state_t *st, const uint8_t *data, size_t len)
+{
+    switch (st->pds_phase) {
+    case PDS_PHASE_COPYR1:
+        /* COPYR1 header (56 bytes, 00 CA 6D 0F ...) */
+        if (len >= 4 && data[1] == 0xCA && data[2] == 0x6D && data[3] == 0x0F) {
+            log_verbose("Received IEBCOPY COPYR1 header");
+            st->seen_copyr1 = true;
+            st->heads = (len >= 28) ? (((uint32_t)data[26] << 8) | data[27]) : 0;
+            if (st->heads == 0) st->heads = 15;
+            st->pds_phase = PDS_PHASE_COPYR2;
+            return 0;
+        }
+        log_warn("Unexpected record before IEBCOPY COPYR1 header (len=%zu)", len);
+        return 0;
+
+    case PDS_PHASE_COPYR2:
+        /* extent list: 16-byte entries from offset 20 (start CCHH at +2, end CCHH, track count) */
+        st->extent_count = 0;
+        for (size_t off = 20; off + 12 <= len && st->extent_count < RECV_MAX_EXTENTS; off += 16) {
+            uint32_t nt = ((uint32_t)data[off + 10] << 8) | data[off + 11];
+            if (nt == 0) break;
+            recv_extent_t *x = &st->extents[st->extent_count++];
+            x->cyl = ((uint32_t)data[off + 2] << 8) | data[off + 3];
+            x->head = ((uint32_t)data[off + 4] << 8) | data[off + 5];
+            x->ntracks = nt;
+        }
+        st->pds_phase = PDS_PHASE_DIR;
+        return 0;
+
+    default: /* directory units and member data are one byte stream */
+        return process_member_bytes(st, data, len);
+    }
 }
 
 static int receive_record_cb(bool is_control, const uint8_t *data, size_t len, void *user_data)
@@ -356,9 +486,10 @@ int do_receive(const ussxmit_opts_t *opts)
 {
     if (!opts) return RC_ERR_SYNTAX;
 
-    receive_state_t state;
+    static receive_state_t state;
     memset(&state, 0, sizeof(state));
     state.opts = opts;
+    state.cur_member = -1;
 
     if (opts->target_dsn[0] != '\0') {
         dsn_normalize(state.target_dsn, sizeof(state.target_dsn), opts->target_dsn);

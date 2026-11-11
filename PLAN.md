@@ -87,7 +87,7 @@ CFLAGS ?= -O2 -fzos-le-char-mode=ascii -D_EXT -D_XOPEN_SOURCE_EXTENDED=1 -I./inc
 
 | Test Category | Target | Result |
 |:---|:---|:---|
-| Unit Tests | `make test` (`tests/test_netdata.c`) | 30 / 30 Passed ✅ |
+| Unit Tests | `make test` (`tests/test_netdata.c`) | 46 / 46 Passed ✅ |
 | CLI Options | `ussxmit -V`, `ussxmit -h` | Passed ✅ |
 | Dataset Archive Inspection | `ussxmit inspect "CCW.TESTPDS.XMI"` | Passed ✅ |
 | Streaming Pipeline (XMIT -> Inspect) | `ussxmit xmit "CCW.TESTSEQ" \| ussxmit inspect` | Passed ✅ |
@@ -99,3 +99,5 @@ CFLAGS ?= -O2 -fzos-le-char-mode=ascii -D_EXT -D_XOPEN_SOURCE_EXTENDED=1 -I./inc
 | Large sequential restore (736 MB, FBS 4160) | `ussxmit xmit DSN \| ussxmit receive NEW` + `cksum` compare | Passed ✅ (v1.1.0) |
 | PDS sized from INMSIZE/INMDIR (3 members, 1.7 MB) | `xmit PDS \| receive NEW` + member `cksum` | Passed ✅ (v1.2.0) |
 | Receive of a TSO TRANSMIT-made PDS stream (IEBCOPY, two INMR02) | `receive NEW < tso.xmi` + member `cksum` | Passed ✅ (v1.2.0) |
+| PDS `xmit` restored by real TSO `RECEIVE` (JCL, ISPPROF, SWIFT.EXP 28 members, EXEC, REXX.*, MYPDS VB, CLIST VB, loadlibs U) | `xmit \| RECEIVE` (`xmit.sh` workflow) + member `cksum` | Passed ✅ (v1.3.0) |
+| Our `receive` of real TSO PDS streams (same list) | `receive NEW < tso.xmi` + member `cksum` | Passed ✅ (v1.3.0) |

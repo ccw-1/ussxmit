@@ -112,6 +112,17 @@ Key text units defined in [`include/netdata.h`](include/netdata.h:1):
 
 ---
 
+### 3.5. IEBCOPY Unload Stream of a PDS (as produced by TSO TRANSMIT)
+
+Record order: `INMR01`, `INMR02` (IEBCOPY), `INMR02` (INMCOPY), `INMR03`, then data records, `INMR06`. The data records carry the byte stream `COPYR1`, `COPYR2`, directory units, member units.
+
+- **COPYR1** (56 bytes): `00CA6D0F`, DSORG, BLKSIZE, LRECL, RECFM, key length, unload block size 3120 at offset 14, UCB type `3030200F`, heads (15) at 26, track bytes 58786 at 28, DS1DSIND/SCAL/LSTAR at 42-51.
+- **COPYR2** (276 bytes): extent count, DEB prefix, then 16-byte extent entries from 0x10 (start CCHH at +6, end CCHH at +10, track count at +14).
+- **Directory unit** (276 bytes): 12-byte count field (`00000000 00 00000000 08 0100`), 8-byte key (highest name of the block, `FF` x 8 for the last), 256-byte block. One 12-byte zero count field ends the directory.
+- **Member unit**: `[00 EE 00 00][CCHH][R][len(3)]` + the raw physical block. `EE` is the 0-based extent index. A member ends with a zero-length header. The first block R is the directory R; R then increments and resets to 1 on a new track.
+- Units are packed into logical records freely (a directory is one record; a short last block carries the EOF header, see 4.1).
+- Verification technique: reload the stream with plain IEBCOPY (`COPY INDD=unload,OUTDD=pds`, unload dataset `RECFM=VS LRECL=32756 BLKSIZE=3120`) to see IEBCOPY's own diagnostics, which real RECEIVE hides.
+
 ## 4. Pure In-Process Execution Architecture
 
 `ussxmit` eliminates scratch disk staging by combining dynamic allocation with native C record I/O and continuous stream encoding:
@@ -154,9 +165,10 @@ graph TD
    - Parses member entries, TTRs, user data (ISPF stats, program object metadata), and ALIAS flags (`C & 0x80`).
    - Probes the first member via `fldata()` to extract exact dataset `RECFM`, `LRECL`, and `BLKSIZE`.
    - Emits `INMR01` and `INMR02` (`INMUTILN = IEBCOPY`, `INMDSORG = 0x0200`, `INMSIZE` and `INMDIR` set). The size comes from a pre-pass that seeks to the end of every non-alias member (`fseek`/`ftell` returns the record count) and sums `ceil(records x LRECL / BLKSIZE) x BLKSIZE` plus the directory.
-   - Emits `COPYR1` header record (56 bytes, `00 CA 6D 0F...`) with 3390 track geometry.
-   - Emits directory header block (276 bytes) and directory blocks (288 bytes each).
-   - Streams member physical data blocks wrapped in 12-byte CKD headers `[0x00000000][CCHH][TTR_R][len]`, terminated with a 12-byte member EOF marker (`len = 0`). Aliases are preserved in directory blocks and skipped during physical data block emission.
+   - Emits two `INMR02` records and an `INMR03`, as TSO TRANSMIT does: `IEBCOPY` (the PDS) and `INMCOPY` (the intermediate unload dataset, VBS 32756/3120).
+   - Emits the IEBCOPY unload stream (format decoded from real TRANSMIT output, see 3.5): `COPYR1` (56 bytes, 3390 geometry), `COPYR2` (276 bytes, one virtual extent), the used directory blocks, then member data.
+   - Members are written in physical order (directory TTR). Each physical block is read raw with `fopen(..., "rb,type=blocked")` and sent as `[12-byte header][block incl. BDW/RDW]`; the header holds the CCHHR derived from the directory TTR and a 3390 track simulation. A member ends with a 12-byte zero-length header. Aliases are kept in the directory and skipped for data.
+   - The member EOF header rides with the last block only if the record stays within `min(source BLKSIZE, 3120)`; otherwise (and for empty members) it is a record of its own. Real IEBCOPY reload rejects streams that attach it to a full-size block (IEB188I, RC 8).
    - Emits `INMR06` trailer, flushes, and frees DDs.
 
 ### 4.2. `receive` Operation
@@ -176,10 +188,10 @@ graph TD
 5. **Sequential Restoration (`DSORG=PS`)**:
    - Opens target via `fopen("DD:RCVOUT", "wb,type=record")` and writes records directly.
 6. **Partitioned Restoration (`DSORG=PO`)** ([`src/receive.c`](src/receive.c:1)):
-   - Identifies `COPYR1` and directory records (276/288 bytes) and extracts member queue.
-   - A real IEBCOPY unload packs whole blocks into one record, so fixed-length members are written in `LRECL` pieces (record I/O takes one record per write). Variable-length (BDW/RDW) blocks of TSO-made streams are not decoded yet.
-   - For each CKD block: allocates `alloc fi(RCVMEM) da('TARGET(MEM)') shr`, writes data blocks via `fopen("DD:RCVMEM", "wb,type=record")`.
-   - On 12-byte EOF block (`len = 0`): closes member file, frees DD, and advances to next member.
+   - After `COPYR1` and `COPYR2`, the directory units (276 bytes: count field, 8-byte key, 256-byte block; a zero count field ends the directory) and the member units (12-byte header + raw block) are decoded as one continuous byte stream, because TSO packs units into records at arbitrary boundaries.
+   - A member is selected by the header CCHHR (relative track through the `COPYR2` extents, with the heads count from `COPYR1`) matched to the directory TTR; fallback is the next unfinished member in directory order.
+   - Raw blocks are decoded per RECFM: U one record per block, V through BDW/RDW, F split by LRECL.
+   - A zero-length header ends the member: the member file is closed and its DD freed.
 7. On `INMR06`: closes all open handles and frees allocated DDs.
 
 ### 4.3. `inspect` Operation

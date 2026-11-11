@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define USSXMIT_VERSION "1.2.0"
+#define USSXMIT_VERSION "1.3.0"
 
 /* Return / Exit Codes */
 #define RC_SUCCESS          0   /* Success */

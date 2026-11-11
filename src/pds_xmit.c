@@ -17,6 +17,51 @@
 #define MAX_MEMBERS 4096
 #define MAX_DIR_BLOCKS 1024
 
+/* Virtual geometry of the unloaded dataset: a 3390 volume. */
+#define UNLOAD_HEADS        15
+#define UNLOAD_TRACK_BYTES  58786
+#define UNLOAD_START_CYL    0x0010
+#define UNLOAD_MAX_RECORD   32756      /* LRECL of the intermediate dataset */
+#define UNLOAD_BLKSIZE      3120       /* BLKSIZE of the intermediate dataset */
+#define TRACK_CELLS         1729       /* 3390 track capacity in 34-byte cells */
+
+/* Cells a record without key and with data length dl occupies on a 3390 track */
+static uint32_t record_cells(size_t dl)
+{
+    return 10 + (uint32_t)((dl + 6 + 33) / 34);
+}
+
+/* CCHH of the relative track tt in the virtual extent */
+static void tt_to_cchh(uint32_t tt, uint8_t out[4])
+{
+    uint32_t cyl = UNLOAD_START_CYL + tt / UNLOAD_HEADS;
+    uint32_t head = tt % UNLOAD_HEADS;
+    out[0] = (cyl >> 8) & 0xFF; out[1] = cyl & 0xFF;
+    out[2] = (head >> 8) & 0xFF; out[3] = head & 0xFF;
+}
+
+/* 12-byte block header: 4 zero bytes, CCHH, R, 3-byte block length */
+static void block_header(uint8_t *h, uint32_t tt, uint8_t r, size_t len)
+{
+    memset(h, 0, 4);
+    tt_to_cchh(tt, h + 4);
+    h[8] = r;
+    h[9] = (len >> 16) & 0xFF; h[10] = (len >> 8) & 0xFF; h[11] = len & 0xFF;
+}
+
+/* Send one header+block unit; units longer than the intermediate dataset's
+ * LRECL continue in the next record. */
+static int emit_unit(netdata_writer_t *w, const uint8_t *buf, size_t len)
+{
+    while (len > 0) {
+        size_t n = len > UNLOAD_MAX_RECORD ? UNLOAD_MAX_RECORD : len;
+        if (netdata_writer_emit_data(w, buf, n) != 0) return -1;
+        buf += n;
+        len -= n;
+    }
+    return 0;
+}
+
 typedef struct {
     char        name_ascii[9];
     uint8_t     name_ebcdic[8];
@@ -26,6 +71,12 @@ typedef struct {
     size_t      userdata_len;
     bool        is_alias;
 } pds_member_entry_t;
+
+/* Members are unloaded in physical order (directory TTR), not name order */
+static int member_ttr_cmp(const void *a, const void *b)
+{
+    return memcmp(((const pds_member_entry_t *)a)->ttr, ((const pds_member_entry_t *)b)->ttr, 3);
+}
 
 int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
                     uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize,
@@ -61,6 +112,7 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
     }
 
     size_t dir_block_count = 0;
+    size_t dir_used_count = 0;   /* blocks up to the one holding the end-of-directory marker */
     size_t n;
     while (dir_block_count < MAX_DIR_BLOCKS &&
            (n = fread(dir_blocks[dir_block_count], 1, 256, fdir)) > 0) {
@@ -69,6 +121,15 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
         uint8_t *blk = dir_blocks[dir_block_count - 1];
         if (n >= 2) {
             uint16_t used = (blk[0] << 8) | blk[1];
+            if (dir_used_count == 0) {
+                /* walk the entries: the marker is an entry whose name starts with 0xFF */
+                uint16_t lim = used > n ? (uint16_t)n : used;
+                size_t eoff = 2;
+                while (eoff + 12 <= lim) {
+                    if (blk[eoff] == 0xFF) { dir_used_count = dir_block_count; break; }
+                    eoff += 12 + (blk[eoff + 11] & 0x1F) * 2;
+                }
+            }
             if (used >= 10 && memcmp(blk + 2, "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF", 8) == 0) {
                 break;
             }
@@ -134,6 +195,8 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
         }
     }
 
+    qsort(members, member_count, sizeof(members[0]), member_ttr_cmp);
+
     log_info("Discovered %zu members in %s", member_count, src_dsn);
 
     /* Probe first member to extract exact dataset RECFM, LRECL, and BLKSIZE */
@@ -160,6 +223,8 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
                     lrecl = (uint32_t)pinfo.__maxreclen;
                     blksize = (uint32_t)pinfo.__blksize;
                     if (lrecl == 0 && (recfm & RECFM_F)) lrecl = 80;
+                    /* TRANSMIT sends the DCB LRECL, which includes the 4-byte RDW of variable records */
+                    if ((recfm & RECFM_V) && (recfm & RECFM_U) != RECFM_U) lrecl += 4;
                     if (blksize == 0) blksize = (lrecl > 0) ? lrecl : 32760;
                     log_verbose("Refined PDS member attributes: RECFM=0x%02X, LRECL=%u, BLKSIZE=%u",
                                 recfm, lrecl, blksize);
@@ -205,37 +270,71 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
         return RC_ERR_STREAM;
     }
 
-    /* INMR02 Dataset Attributes */
-    if (netdata_writer_emit_inmr02(writer, src_dsn, dsorg, recfm, lrecl, blksize, size_bytes,
-                                   (uint32_t)(dir_block_count > 0 ? dir_block_count : 1)) != 0) {
-        log_error("Failed to emit INMR02 record");
+    /* INMR02 #1 describes the PDS (IEBCOPY), INMR02 #2 the intermediate unload
+     * dataset (INMCOPY, VBS 32756/3120) and INMR03 its records, as TRANSMIT does. */
+    if (netdata_writer_emit_inmr02_ex(writer, "IEBCOPY", src_dsn, dsorg, recfm, 0x00, lrecl, blksize,
+                                      size_bytes, (uint32_t)(dir_block_count > 0 ? dir_block_count : 1)) != 0 ||
+        netdata_writer_emit_inmr02_ex(writer, "INMCOPY", NULL, DSORG_PS, 0x48, 0x02, 32756, 3120,
+                                      size_bytes, 0) != 0 ||
+        netdata_writer_emit_inmr03(writer, DSORG_PS, 0x01, 80, size_bytes) != 0) {
+        log_error("Failed to emit INMR02/INMR03 records");
         free(members);
         free(dir_blocks);
         return RC_ERR_STREAM;
     }
 
-    /* Step 4: Emit IEBCOPY Unloaded Dataset Header & Directory Records */
+    /* Step 4: Emit IEBCOPY unloaded dataset header, COPYR2 and directory records.
+     *
+     * Real IEBCOPY reload locates a member through the directory TTR, so the
+     * unload must describe a consistent (virtual) set of extents: a 3390-style
+     * geometry (15 heads) starting at UNLOAD_START_CYL, and every block header
+     * carries the CCHHR that results from the member's directory TTR. */
+    uint32_t max_tt = 0;
+    for (size_t m = 0; m < member_count; m++) {
+        uint32_t tt = ((uint32_t)members[m].ttr[0] << 8) | members[m].ttr[1];
+        if (tt > max_tt) max_tt = tt;
+    }
+    /* Members longer than a track continue on following tracks; reserve generously */
+    uint64_t ntracks = (uint64_t)max_tt + 1 + size_bytes / 8192 + 2;
+    ntracks = (ntracks + UNLOAD_HEADS - 1) / UNLOAD_HEADS * UNLOAD_HEADS;   /* whole cylinders */
+    if (ntracks > 0xFFFF) ntracks = 0xFFFF;
+
+    /* DS1LSTAR (last used TTR) is only known after streaming, but COPYR1 goes
+     * first: use the highest member start from the directory. */
+    uint32_t lstar_tt = max_tt;
+    uint8_t  lstar_r  = 0;
+    for (size_t m = 0; m < member_count; m++) {
+        uint32_t tt = ((uint32_t)members[m].ttr[0] << 8) | members[m].ttr[1];
+        if (tt == max_tt && members[m].ttr[2] > lstar_r) lstar_r = members[m].ttr[2];
+    }
+
     /* 4a. COPYR1 Header (56 bytes) */
     uint8_t copyr1[56];
     memset(copyr1, 0, sizeof(copyr1));
-    copyr1[0] = 0x00;
     copyr1[1] = 0xCA; copyr1[2] = 0x6D; copyr1[3] = 0x0F;
     copyr1[4] = (dsorg >> 8) & 0xFF; copyr1[5] = dsorg & 0xFF;
     copyr1[6] = (blksize >> 8) & 0xFF; copyr1[7] = blksize & 0xFF;
     copyr1[8] = (lrecl >> 8) & 0xFF; copyr1[9] = lrecl & 0xFF;
     copyr1[10] = recfm;
-    copyr1[11] = 0x00;
+    copyr1[11] = 0x00;                                  /* key length */
     copyr1[12] = 0x00; copyr1[13] = 0x80;
-    copyr1[14] = (blksize >> 8) & 0xFF; copyr1[15] = blksize & 0xFF;
-
-    static const uint8_t geom[] = {
-        0x30, 0x30, 0x20, 0x0F, 0x00, 0x00, 0x7F, 0xF8,
-        0x7F, 0xF8, 0x00, 0x0F, 0xE5, 0xA2, 0x00, 0x00,
-        0x22, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x7E,
-        0x01, 0x34, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00,
-        0x01, 0x00, 0x00, 0x0E, 0xB3, 0xB2, 0x00, 0x00
-    };
-    memcpy(copyr1 + 16, geom, sizeof(geom));
+    copyr1[14] = 0x0C; copyr1[15] = 0x30;               /* block size of the unload dataset (3120) */
+    copyr1[16] = 0x30; copyr1[17] = 0x30; copyr1[18] = 0x20; copyr1[19] = 0x0F;  /* UCB type: 3390 */
+    copyr1[22] = 0x7F; copyr1[23] = 0xF8;
+    copyr1[24] = 0x7F; copyr1[25] = 0xF8;
+    copyr1[26] = 0x00; copyr1[27] = UNLOAD_HEADS;
+    copyr1[28] = (UNLOAD_TRACK_BYTES >> 8) & 0xFF; copyr1[29] = UNLOAD_TRACK_BYTES & 0xFF;
+    copyr1[32] = 0x22; copyr1[33] = 0x52;
+    copyr1[37] = 0x02; copyr1[38] = 0x00; copyr1[39] = 0x7E;
+    copyr1[40] = 0x01; copyr1[41] = 0x3B;
+    copyr1[42] = 0x80;                                  /* DS1DSIND: last volume */
+    if (blksize <= 0x1FFF) { copyr1[43] = (blksize >> 8) & 0xFF; copyr1[44] = blksize & 0xFF; }
+    copyr1[45] = 0xC0;                                  /* DS1SCALO: cylinders */
+    {
+        uint32_t ncyl = (uint32_t)(ntracks / UNLOAD_HEADS);
+        copyr1[46] = (ncyl >> 16) & 0xFF; copyr1[47] = (ncyl >> 8) & 0xFF; copyr1[48] = ncyl & 0xFF;
+    }
+    copyr1[49] = (lstar_tt >> 8) & 0xFF; copyr1[50] = lstar_tt & 0xFF; copyr1[51] = lstar_r;
 
     if (netdata_writer_emit_data(writer, copyr1, sizeof(copyr1)) != 0) {
         log_error("Failed to emit COPYR1 header record");
@@ -244,51 +343,55 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
         return RC_ERR_STREAM;
     }
 
-    /* 4b. Record #6: First Directory Block / Device header (276 bytes) */
-    uint8_t rec6[276];
-    memset(rec6, 0, sizeof(rec6));
-    rec6[0] = 0x01; rec6[1] = 0x00; rec6[2] = 0x00; rec6[3] = 0x00;
-    rec6[4] = 0xFF; rec6[5] = 0x00; rec6[6] = 0x00; rec6[7] = 0x00;
-    rec6[8] = 0x8F; rec6[9] = 0x03; rec6[10] = 0xD0; rec6[11] = 0x00;
-    /* Dummy key */
-    rec6[12] = 0x04; rec6[13] = 0x3B; rec6[14] = 0x50; rec6[15] = 0xD8;
-    rec6[16] = 0x58; rec6[17] = 0xCF; rec6[18] = 0x7C; rec6[19] = 0x50;
-    /* 256-byte track pointer */
-    rec6[20] = 0x00; rec6[21] = 0x00; rec6[22] = 0x0C; rec6[23] = 0x0D;
-    rec6[24] = 0x00; rec6[25] = 0x00; rec6[26] = 0x0C; rec6[27] = 0x0D;
-    rec6[28] = 0x00; rec6[29] = 0x00; rec6[30] = 0x00; rec6[31] = 0x01;
+    /* 4b. COPYR2: DEB image with the (single, virtual) extent (276 bytes) */
+    uint8_t copyr2[276];
+    memset(copyr2, 0, sizeof(copyr2));
+    static const uint8_t deb[] = { 0x01, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
+                                   0x8F, 0x03, 0xD0, 0x00, 0x04, 0x8A, 0x20, 0xD8,
+                                   0x58, 0xFA, 0x39, 0xA0 };
+    memcpy(copyr2, deb, sizeof(deb));
+    uint8_t cc[4];
+    tt_to_cchh(0, cc);
+    memcpy(copyr2 + 22, cc, 4);                          /* extent start CCHH */
+    tt_to_cchh((uint32_t)(ntracks - 1), cc);
+    memcpy(copyr2 + 26, cc, 4);                          /* extent end CCHH */
+    copyr2[30] = (ntracks >> 8) & 0xFF; copyr2[31] = ntracks & 0xFF;
 
-    if (netdata_writer_emit_data(writer, rec6, sizeof(rec6)) != 0) {
-        log_error("Failed to emit directory header record #6");
+    if (netdata_writer_emit_data(writer, copyr2, sizeof(copyr2)) != 0) {
+        log_error("Failed to emit COPYR2 record");
         free(members);
         free(dir_blocks);
         return RC_ERR_STREAM;
     }
 
-    /* 4c. Record #7+: Directory Block Records (288 bytes each) */
-    for (size_t b = 0; b < (dir_block_count > 0 ? dir_block_count : 1); b++) {
-        uint8_t dirrec[288];
+    /* 4c. Directory blocks, one 276-byte unit each: count field (CCHHR zero, KL=8,
+     * DL=256), the key (highest name in the block, X'FF' for the block holding the
+     * end marker) and the 256-byte block. A zero count field ends the directory. */
+    if (dir_used_count == 0) dir_used_count = dir_block_count;
+    if (dir_used_count == 0) dir_used_count = 1;
+    for (size_t b = 0; b < dir_used_count; b++) {
+        uint8_t dirrec[276 + 12];
         memset(dirrec, 0, sizeof(dirrec));
-        dirrec[8] = 0x00; dirrec[9] = 0x08;
+        dirrec[9] = 0x08;
         dirrec[10] = 0x01; dirrec[11] = 0x00;
 
-        /* Find highest key in this block or default to 0xFF */
         memset(dirrec + 12, 0xFF, 8);
-        if (dir_block_count > 0) {
+        if (b < dir_block_count) {
             uint8_t *blk = dir_blocks[b];
             uint16_t used = (blk[0] << 8) | blk[1];
             if (used > 256) used = 256;
             size_t off = 2;
             while (off + 12 <= used) {
+                memcpy(dirrec + 12, blk + off, 8);   /* the end marker itself (FF..) is the key of the last block */
                 if (blk[off] == 0xFF) break;
-                memcpy(dirrec + 12, blk + off, 8);
                 uint8_t c = blk[off + 11] & 0x1F;
                 off += 12 + c * 2;
             }
             memcpy(dirrec + 20, blk, 256);
         }
 
-        if (netdata_writer_emit_data(writer, dirrec, sizeof(dirrec)) != 0) {
+        size_t reclen = 276 + (b + 1 == dir_used_count ? 12 : 0);   /* trailing zero count after the last block */
+        if (netdata_writer_emit_data(writer, dirrec, reclen) != 0) {
             log_error("Failed to emit directory record for block %zu", b + 1);
             free(members);
             free(dir_blocks);
@@ -296,23 +399,23 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
         }
     }
 
-    /* Step 5: Read and emit member data blocks */
-    uint16_t track = 0x0C0D;
-    uint8_t rec_num = 1;
-
+    /* Step 5: Read and emit member data. Each physical block is sent whole,
+     * with its BDW/RDW for variable formats, behind a 12-byte header holding
+     * the block's CCHHR and length; the member ends with a zero-length header. */
     uint8_t *block_buf = malloc(65536);
-    uint8_t *ckd_buf = malloc(65536 + 24);
-    if (!block_buf || !ckd_buf) {
+    uint8_t *pend_buf = malloc(65536 + 24);
+    if (!block_buf || !pend_buf) {
         log_error("Out of memory allocating member record buffers");
         free(block_buf);
-        free(ckd_buf);
+        free(pend_buf);
         free(members);
         free(dir_blocks);
         return RC_ERR_INTERNAL;
     }
 
     size_t total_member_blocks = 0;
-    for (size_t m = 0; m < member_count; m++) {
+    int stream_rc = 0;
+    for (size_t m = 0; m < member_count && stream_rc == 0; m++) {
         pds_member_entry_t *mbr = &members[m];
         if (mbr->is_alias) {
             /* Skip aliases during physical data streaming */
@@ -327,68 +430,78 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
             continue;
         }
 
-        FILE *fmem = fopen("DD:MBRDD", "rb,type=record");
+        FILE *fmem = fopen("DD:MBRDD", "rb,type=blocked");
         if (!fmem) {
             log_warn("Failed to open member '%s': %s (skipping)", mbr->name_ascii, strerror(errno));
             dynalloc_str("free fi(MBRDD)", msg, sizeof(msg));
             continue;
         }
 
+        /* Block addresses follow the directory TTR of the member and then fill
+         * 3390 tracks the way the DASD does, so that no block of a member
+         * carries the address another member starts at. */
+        uint32_t tt = ((uint32_t)mbr->ttr[0] << 8) | mbr->ttr[1];
+        unsigned r = mbr->ttr[2];
+        uint32_t used = 0;           /* cells in use on the current track */
         size_t nread;
         size_t mbr_blocks = 0;
+        size_t pend_len = 0;
         while ((nread = fread(block_buf, 1, 65536, fmem)) > 0) {
+            if (pend_len > 0 && emit_unit(writer, pend_buf, pend_len) != 0) { stream_rc = -1; break; }
+            uint32_t need = record_cells(nread);
+            if (mbr_blocks == 0) {
+                used = (r - 1) * need;              /* records before the member on its first track */
+            } else if (used + need > TRACK_CELLS || r > 255) {
+                tt++; r = 1; used = 0;
+            }
             mbr_blocks++;
             total_member_blocks++;
-
-            /* 12-byte CKD block header */
-            ckd_buf[0] = 0; ckd_buf[1] = 0; ckd_buf[2] = 0; ckd_buf[3] = 0;
-            ckd_buf[4] = (track >> 8) & 0xFF; ckd_buf[5] = track & 0xFF;
-            ckd_buf[6] = (track >> 8) & 0xFF; ckd_buf[7] = track & 0xFF;
-            ckd_buf[8] = rec_num++;
-            ckd_buf[9] = (nread >> 16) & 0xFF;
-            ckd_buf[10] = (nread >> 8) & 0xFF;
-            ckd_buf[11] = nread & 0xFF;
-
-            memcpy(ckd_buf + 12, block_buf, nread);
-            if (netdata_writer_emit_data(writer, ckd_buf, 12 + nread) != 0) {
-                log_error("Failed to emit member block for '%s'", mbr->name_ascii);
-                fclose(fmem);
-                dynalloc_str("free fi(MBRDD)", msg, sizeof(msg));
-                free(block_buf);
-                free(ckd_buf);
-                free(members);
-                free(dir_blocks);
-                return RC_ERR_STREAM;
-            }
+            block_header(pend_buf, tt, (uint8_t)r++, nread);
+            used += need;
+            memcpy(pend_buf + 12, block_buf, nread);
+            pend_len = 12 + nread;
         }
 
         fclose(fmem);
         dynalloc_str("free fi(MBRDD)", msg, sizeof(msg));
 
-        /* 12-byte Member EOF record (length = 0) */
-        ckd_buf[0] = 0; ckd_buf[1] = 0; ckd_buf[2] = 0; ckd_buf[3] = 0;
-        ckd_buf[4] = (track >> 8) & 0xFF; ckd_buf[5] = track & 0xFF;
-        ckd_buf[6] = (track >> 8) & 0xFF; ckd_buf[7] = track & 0xFF;
-        ckd_buf[8] = rec_num++;
-        ckd_buf[9] = 0; ckd_buf[10] = 0; ckd_buf[11] = 0;
-
-        if (netdata_writer_emit_data(writer, ckd_buf, 12) != 0) {
-            log_error("Failed to emit EOF marker for member '%s'", mbr->name_ascii);
-            free(block_buf);
-            free(ckd_buf);
-            free(members);
-            free(dir_blocks);
-            return RC_ERR_STREAM;
+        if (stream_rc == 0) {
+            /* 12-byte member EOF header (length 0). Like IEBCOPY, it rides with the
+             * last block only while the record stays within the smaller of the
+             * source BLKSIZE and the unload block size; otherwise (and for an
+             * empty member) it is a record of its own. IEBCOPY's reload rejects
+             * streams that attach it to a full-size block. */
+            if (used + record_cells(0) > TRACK_CELLS || r > 255) { tt++; r = 1; }
+            size_t eof_limit = blksize < UNLOAD_BLKSIZE ? blksize : UNLOAD_BLKSIZE;
+            if (pend_len > 0 && pend_len + 12 > eof_limit) {
+                if (emit_unit(writer, pend_buf, pend_len) != 0) stream_rc = -1;
+                pend_len = 0;
+            }
+            if (stream_rc == 0) {
+                block_header(pend_buf + pend_len, tt, (uint8_t)r, 0);
+                pend_len += 12;
+                if (emit_unit(writer, pend_buf, pend_len) != 0) stream_rc = -1;
+            }
+        }
+        if (stream_rc != 0) {
+            log_error("Failed to emit data for member '%s'", mbr->name_ascii);
+            break;
         }
 
         log_verbose("Streamed member '%s' (%zu blocks)", mbr->name_ascii, mbr_blocks);
     }
 
+    free(block_buf);
+    free(pend_buf);
+    if (stream_rc != 0) {
+        free(members);
+        free(dir_blocks);
+        return RC_ERR_STREAM;
+    }
+
     /* Step 6: Emit INMR06 Trailer Record */
     if (netdata_writer_emit_inmr06(writer) != 0) {
         log_error("Failed to emit INMR06 trailer record");
-        free(block_buf);
-        free(ckd_buf);
         free(members);
         free(dir_blocks);
         return RC_ERR_STREAM;
@@ -399,8 +512,6 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
     log_info("Successfully unloaded PDS %s (%zu members, %zu total blocks)",
              src_dsn, member_count, total_member_blocks);
 
-    free(block_buf);
-    free(ckd_buf);
     free(members);
     free(dir_blocks);
     return RC_SUCCESS;
