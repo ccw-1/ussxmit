@@ -120,6 +120,7 @@ Sample inspection output:
  Record Format: FB
  Record Length: 80
  Block Size   : 3120
+ Size (bytes) : 560
  Utility Name : IEBCOPY
  Origin       : ZOSCAN56.CCW
  Timestamp    : 2026-11-04 16:37:29

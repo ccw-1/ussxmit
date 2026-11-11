@@ -96,3 +96,4 @@ CFLAGS ?= -O2 -fzos-le-char-mode=ascii -D_EXT -D_XOPEN_SOURCE_EXTENDED=1 -I./inc
 | PDS Streaming Pipeline (XMIT -> Receive) | `ussxmit xmit "CCW.TESTPDS" \| ussxmit receive -f ...` | Passed ✅ |
 | Restored PDS Member Integrity | Re-xmit & verify members (`MBR1`, `MBR2`) | Passed ✅ |
 | PDSE GOFF Program Object Stream | `ussxmit xmit "CCW.GO.PDSE" \| ussxmit inspect` | Passed ✅ |
+| Large sequential restore (736 MB, FBS 4160) | `ussxmit xmit DSN \| ussxmit receive NEW` + `cksum` compare | Passed ✅ (v1.1.0) |

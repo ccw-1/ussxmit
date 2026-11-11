@@ -102,7 +102,7 @@ Key text units defined in [`include/netdata.h`](include/netdata.h:1):
 - `INMEXPDT` (`0x0022`): Expiration date.
 - `INMTERM`  (`0x0028`): Terminal transmission flag.
 - `INMUTILN` (`0x002B` / `0x1028`): Utility program name (`INMCOPY` / `IEBCOPY`).
-- `INMSIZE`  (`0x0030`): Dataset size estimate.
+- `INMSIZE`  (`0x102C`): Approximate file size in bytes (numeric, 1-8 bytes; `0` = unknown). Written by `xmit` for sequential datasets (record count x `LRECL`) and used by `receive` to size the target allocation.
 - `INMDSORG` (`0x003C`): Dataset organization (`0x4000` = PS, `0x0200` = PO).
 - `INMRECFM` (`0x0049`): Record format (`0x80` = Fixed, `0x40` = Variable, `0x10` = Blocked, etc.).
 - `INMLRECL` (`0x0042`): Logical record length.
@@ -143,14 +143,15 @@ graph TD
 3. Opens the dataset using `fopen("DD:XMITIN", "rb,type=record")` for native binary record I/O.
 4. Queries dataset characteristics using `fldata()` to extract `dsorg`, `recfm`, `maxreclen`, and `blksize`.
 5. **Sequential Datasets (`DSORG=PS`)**:
-   - Emits `INMR01` and `INMR02` (`INMUTILN = INMCOPY`).
+   - Seeks to the end of the record stream (`fseek`/`ftell`, O(1) on z/OS) to learn the record count, rewinds, and derives `INMSIZE` = records x `LRECL`.
+   - Emits `INMR01` and `INMR02` (`INMUTILN = INMCOPY`, `INMSIZE` set).
    - Reads records sequentially via `fread()` and emits Netdata data records (spanned if >253 bytes).
    - Emits `INMR06` trailer, flushes, and frees DD.
 6. **Partitioned Datasets (`DSORG=PO` — PDS & PDSE)** ([`src/pds_xmit.c`](src/pds_xmit.c:1)):
    - Reads 256-byte directory blocks from `fopen("DD:PDSDIR", "rb,type=record")`.
    - Parses member entries, TTRs, user data (ISPF stats, program object metadata), and ALIAS flags (`C & 0x80`).
    - Probes the first member via `fldata()` to extract exact dataset `RECFM`, `LRECL`, and `BLKSIZE`.
-   - Emits `INMR01` and `INMR02` (`INMUTILN = IEBCOPY`, `INMDSORG = 0x0200`).
+   - Emits `INMR01` and `INMR02` (`INMUTILN = IEBCOPY`, `INMDSORG = 0x0200`, `INMSIZE = 0` because a PDS size is not known up front).
    - Emits `COPYR1` header record (56 bytes, `00 CA 6D 0F...`) with 3390 track geometry.
    - Emits directory header block (276 bytes) and directory blocks (288 bytes each).
    - Streams member physical data blocks wrapped in 12-byte CKD headers `[0x00000000][CCHH][TTR_R][len]`, terminated with a 12-byte member EOF marker (`len = 0`). Aliases are preserved in directory blocks and skipped during physical data block emission.
@@ -161,10 +162,13 @@ graph TD
 2. Reads 80-byte card images from `stdin`.
 3. Reassembles continuous segments and spanned records.
 4. On `INMR02`:
-   - Decodes text units (`INMDSNAM`, `INMDSORG`, `INMRECFM`, `INMLRECL`, `INMBLKSIZE`, `INMDIR`).
+   - Decodes text units (`INMDSNAM`, `INMDSORG`, `INMRECFM`, `INMLRECL`, `INMBLKSIZE`, `INMSIZE`, `INMDIR`).
    - Resolves target dataset name (command-line override or embedded dataset name).
    - If `-f` / `--force` specified, invokes `dynalloc_delete_dsn()` to delete existing cataloged dataset.
-   - Dynamically allocates target dataset via `BPXWDYN` (adding `dir(...)` for PDS).
+   - Dynamically allocates target dataset via `BPXWDYN` (adding `dir(...)` for PDS). Space is sized like TSO RECEIVE:
+     - `INMSIZE` > 0: `block(BLKSIZE) space(size/BLKSIZE, size/BLKSIZE/4) release` (primary from the sender's size, secondaries for underestimates, unused space released on close).
+     - `INMSIZE` absent or 0 (XMIT370 streams, PDS/PDSE): `cyl space(1,500) release`.
+     - The constants are `RECV_*` macros in [`src/receive.c`](src/receive.c:1).
 5. **Sequential Restoration (`DSORG=PS`)**:
    - Opens target via `fopen("DD:RCVOUT", "wb,type=record")` and writes records directly.
 6. **Partitioned Restoration (`DSORG=PO`)** ([`src/receive.c`](src/receive.c:1)):
@@ -182,6 +186,7 @@ graph TD
    - Organization (`PS`, `PO`, `DA`).
    - Record format (`FB`, `VB`, `U`, etc.).
    - Logical record length (`LRECL`) and Block size (`BLKSIZE`).
+   - Approximate size in bytes (`INMSIZE`, when non-zero).
    - Directory blocks (for PDS).
    - Utility name (`INMCOPY` / `IEBCOPY`).
    - Origin node and user ID.
