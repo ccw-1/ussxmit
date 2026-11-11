@@ -251,9 +251,12 @@ static int receive_record_cb(bool is_control, const uint8_t *data, size_t len, v
                 snprintf(dir_str, sizeof(dir_str), " dir(%u)", dir_blk);
             }
 
+            /* The stream carries no reliable size, so allocate a small primary
+             * and large secondary extents (up to 16 x 500 cylinders) and give
+             * back unused space on close. */
             char alloc_cmd[256];
             snprintf(alloc_cmd, sizeof(alloc_cmd),
-                     "alloc fi(RCVOUT) da('%s') new catalog tracks space(10,50)%s recfm(%s) lrecl(%u) blksize(%u)",
+                     "alloc fi(RCVOUT) da('%s') new catalog cyl space(1,500) release%s recfm(%s) lrecl(%u) blksize(%u)",
                      st->target_dsn, dir_str, recfm_str, lrecl, blksize);
 
             log_verbose("Allocating target dataset: %s", alloc_cmd);
