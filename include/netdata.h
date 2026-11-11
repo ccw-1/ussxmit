@@ -17,11 +17,13 @@
 /* Netdata Text Unit Keys */
 #define INMDSNAM_KEY    0x0002  /* Dataset name qualifiers */
 #define INMMBR_KEY      0x0003  /* Member name */
-#define INMDIR_KEY      0x000B  /* Directory blocks count */
+#define INMSECND_KEY    0x000B  /* Secondary space quantity */
+#define INMDIR_KEY      0x000C  /* Directory blocks count */
 #define INMEXPDT_KEY    0x0022  /* Expiration date */
 #define INMTERM_KEY     0x0028  /* Terminal transmission */
 #define INMUTILN_KEY    0x002B  /* Utility name (e.g. INMCOPY, IEBCOPY) */
 #define INMSIZE_KEY     0x102C  /* Approximate file size in bytes (0 = unknown) */
+#define INMLSIZE_KEY    0x8018  /* File size in megabytes, used when INMSIZE does not fit 4 bytes */
 #define INMDSORG_KEY    0x003C  /* Dataset organization (0x4000=PS, 0x0200=PO) */
 #define INMLRECL_KEY    0x0042  /* Logical record length */
 #define INMRECFM_KEY    0x0049  /* Record format flags */
@@ -57,7 +59,7 @@ typedef struct {
     uint32_t    blksize;
     uint32_t    dir_blocks;
     uint32_t    num_records;
-    uint64_t    size_bytes;     /* INMSIZE: approximate size in bytes, 0 = not given */
+    uint64_t    size_bytes;     /* INMSIZE (or INMLSIZE x 1 MB): approximate size in bytes, 0 = not given */
     bool        has_inmr01;
     bool        has_inmr02;
 } netdata_info_t;
@@ -74,7 +76,7 @@ typedef struct {
 void netdata_writer_init(netdata_writer_t *w, FILE *out_fp);
 int  netdata_writer_emit_record(netdata_writer_t *w, bool is_control, const uint8_t *data, size_t len);
 int  netdata_writer_emit_inmr01(netdata_writer_t *w, const char *node, const char *user);
-int  netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize, uint64_t size_bytes);
+int  netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize, uint64_t size_bytes, uint32_t dir_blocks);
 int  netdata_writer_emit_inmr03(netdata_writer_t *w, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint64_t size_bytes);
 int  netdata_writer_emit_data(netdata_writer_t *w, const uint8_t *data, size_t len);
 int  netdata_writer_emit_inmr06(netdata_writer_t *w);

@@ -59,17 +59,35 @@ static void write_u32_be(uint8_t *p, uint32_t val)
     p[3] = (uint8_t)(val & 0xFF);
 }
 
-/* Append an INMSIZE text unit (key, count 1, length, value); returns bytes written */
+/* Append the size text unit: INMSIZE (bytes, 4 bytes) when it fits, otherwise
+ * INMLSIZE (megabytes, 4 bytes, rounded up) as TSO TRANSMIT does for sizes
+ * above 4 GB. Returns bytes written. */
 static size_t write_inmsize_tu(uint8_t *p, uint64_t size_bytes)
 {
-    size_t vlen = (size_bytes > 0xFFFFFFFFULL) ? 8 : 4;
-    write_u16_be(p, INMSIZE_KEY);
-    write_u16_be(p + 2, 1);
-    write_u16_be(p + 4, (uint16_t)vlen);
-    for (size_t i = 0; i < vlen; i++) {
-        p[6 + i] = (uint8_t)(size_bytes >> (8 * (vlen - 1 - i)));
+    uint16_t key = INMSIZE_KEY;
+    uint64_t val = size_bytes;
+    if (size_bytes > 0xFFFFFFFFULL) {
+        key = INMLSIZE_KEY;
+        val = (size_bytes + 0xFFFFFULL) >> 20;
+        if (val > 0xFFFFFFFFULL) val = 0xFFFFFFFFULL;
     }
-    return 6 + vlen;
+    write_u16_be(p, key);
+    write_u16_be(p + 2, 1);
+    write_u16_be(p + 4, 4);
+    write_u32_be(p + 6, (uint32_t)val);
+    return 10;
+}
+
+/* Append an INMDIR text unit (directory blocks, 3 bytes); returns bytes written */
+static size_t write_inmdir_tu(uint8_t *p, uint32_t dir_blocks)
+{
+    write_u16_be(p, INMDIR_KEY);
+    write_u16_be(p + 2, 1);
+    write_u16_be(p + 4, 3);
+    p[6] = (uint8_t)(dir_blocks >> 16);
+    p[7] = (uint8_t)(dir_blocks >> 8);
+    p[8] = (uint8_t)dir_blocks;
+    return 9;
 }
 
 /* ================================================================== */
@@ -234,7 +252,7 @@ int netdata_writer_emit_inmr01(netdata_writer_t *w, const char *node, const char
     return netdata_writer_emit_record(w, true, buf, off);
 }
 
-int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize, uint64_t size_bytes)
+int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize, uint64_t size_bytes, uint32_t dir_blocks)
 {
     uint8_t buf[256];
     size_t off = 0;
@@ -257,6 +275,11 @@ int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t ds
 
     /* TU 0x102C: INMSIZE, approximate file size in bytes (0 = unknown) */
     off += write_inmsize_tu(buf + off, size_bytes);
+
+    /* TU 0x000C: INMDIR, directory blocks of a partitioned dataset */
+    if (dir_blocks > 0) {
+        off += write_inmdir_tu(buf + off, dir_blocks);
+    }
 
     /* TU 0x003C: DSORG (2 bytes) */
     write_u16_be(buf + off, 0x003C); off += 2;
@@ -461,6 +484,8 @@ void netdata_parse_text_units(const uint8_t *p, size_t len, netdata_info_t *info
                     info->blksize = read_u32_be(val, tlen);
                 } else if (key == INMSIZE_KEY) {
                     info->size_bytes = read_u64_be(val, tlen);
+                } else if (key == INMLSIZE_KEY && info->size_bytes == 0) {
+                    info->size_bytes = read_u64_be(val, tlen) << 20;
                 } else if (key == 0x1028 && tlen < sizeof(info->utility_name)) {
                     memcpy(info->utility_name, val, tlen);
                     info->utility_name[tlen] = '\0';

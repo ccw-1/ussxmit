@@ -20,6 +20,7 @@
 #define RECV_SECONDARY_DIVISOR     4u        /* secondary extent = 1/4 of the primary */
 #define RECV_DEFAULT_PRIMARY_CYL   1u        /* used when the sender gave no size */
 #define RECV_DEFAULT_SECONDARY_CYL 500u
+#define RECV_DEFAULT_DIR_BLOCKS    20u       /* used when a PDS stream has no INMDIR */
 
 static const uint8_t inmr01_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF1};
 static const uint8_t inmr02_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF2};
@@ -37,6 +38,7 @@ typedef struct {
     char                  target_dsn[64];
     FILE                 *out_fp;
     bool                  target_allocated;
+    bool                  inmr02_seen;      /* TSO streams carry several INMR02; only the first describes the target */
     size_t                records_restored;
     int                   error_code;
 
@@ -177,12 +179,23 @@ static int process_pds_ckd_data(receive_state_t *st, const uint8_t *data, size_t
             }
 
             if (st->out_mem_fp) {
-                if (fwrite(data + off, 1, block_len, st->out_mem_fp) != block_len) {
-                    log_error("Failed writing member block");
-                    st->error_code = RC_ERR_STREAM;
-                    return -1;
+                /* A real IEBCOPY unload holds whole blocks; record I/O takes one
+                 * fixed-length record per write, so split them. Our own streams
+                 * carry one record per block and pass through unchanged. */
+                size_t chunk = block_len;
+                if ((st->info.recfm & RECFM_U) != RECFM_U && !(st->info.recfm & RECFM_V) &&
+                    st->info.lrecl > 0 && block_len > st->info.lrecl) {
+                    chunk = st->info.lrecl;
                 }
-                st->records_restored++;
+                for (size_t done = 0; done < block_len; done += chunk) {
+                    size_t n = (block_len - done < chunk) ? block_len - done : chunk;
+                    if (fwrite(data + off + done, 1, n, st->out_mem_fp) != n) {
+                        log_error("Failed writing member block");
+                        st->error_code = RC_ERR_STREAM;
+                        return -1;
+                    }
+                    st->records_restored++;
+                }
             }
             off += block_len;
         } else {
@@ -212,6 +225,11 @@ static int receive_record_cb(bool is_control, const uint8_t *data, size_t len, v
                 netdata_parse_text_units(data + 6, len - 6, &st->info, false);
             }
         } else if (len >= 6 && memcmp(data, inmr02_eye, 6) == 0) {
+            if (st->inmr02_seen) {
+                log_verbose("Ignoring additional INMR02 (describes the intermediate unload dataset)");
+                return 0;
+            }
+            st->inmr02_seen = true;
             log_verbose("Processing INMR02 dataset attributes");
             st->info.has_inmr02 = true;
             if (len > 10) {
@@ -253,7 +271,7 @@ static int receive_record_cb(bool is_control, const uint8_t *data, size_t len, v
             char dir_str[32] = "";
             st->is_pds = (st->info.dsorg & DSORG_PO) != 0;
             if (st->is_pds) {
-                uint32_t dir_blk = st->info.dir_blocks ? st->info.dir_blocks : 20;
+                uint32_t dir_blk = st->info.dir_blocks ? st->info.dir_blocks : RECV_DEFAULT_DIR_BLOCKS;
                 snprintf(dir_str, sizeof(dir_str), " dir(%u)", dir_blk);
             }
 

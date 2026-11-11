@@ -102,7 +102,7 @@ int do_xmit(const ussxmit_opts_t *opts)
     log_verbose("Estimated dataset size: %llu bytes", (unsigned long long)size_bytes);
 
     /* Emit INMR02 Dataset Utility / Attributes */
-    if (netdata_writer_emit_inmr02(&writer, src_dsn, dsorg, recfm, lrecl, blksize, size_bytes) != 0) {
+    if (netdata_writer_emit_inmr02(&writer, src_dsn, dsorg, recfm, lrecl, blksize, size_bytes, 0) != 0) {
         log_error("Failed to emit INMR02 record");
         fclose(fp);
         dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));

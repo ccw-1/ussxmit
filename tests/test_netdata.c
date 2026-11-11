@@ -78,7 +78,7 @@ static void test_netdata_encode_decode(void)
     int rc = netdata_writer_emit_inmr01(&writer, "POKNODE", "TESTUSER");
     TEST_ASSERT(rc == 0, "Emit INMR01 transmission header");
 
-    rc = netdata_writer_emit_inmr02(&writer, "MY.TEST.SEQDSN", DSORG_PS, RECFM_F | RECFM_B, 80, 3120, 0);
+    rc = netdata_writer_emit_inmr02(&writer, "MY.TEST.SEQDSN", DSORG_PS, RECFM_F | RECFM_B, 80, 3120, 0, 0);
     TEST_ASSERT(rc == 0, "Emit INMR02 dataset attributes");
 
     const char test_line[] = "Line 1: Sample data record payload for test verification.";
@@ -142,7 +142,7 @@ static void test_spanned_records(void)
     netdata_writer_init(&writer, tmp);
 
     netdata_writer_emit_inmr01(&writer, "POK", "CCW");
-    netdata_writer_emit_inmr02(&writer, "SPANNED.DATA", DSORG_PS, RECFM_V | RECFM_B, 1000, 32760, 0);
+    netdata_writer_emit_inmr02(&writer, "SPANNED.DATA", DSORG_PS, RECFM_V | RECFM_B, 1000, 32760, 0, 0);
 
     /* Generate 600-byte test pattern */
     uint8_t large_payload[600];
@@ -177,6 +177,41 @@ static void test_spanned_records(void)
     TEST_ASSERT(memcmp(ctx.last_data, large_payload, 600) == 0, "Payload bytes match original pattern identically");
 }
 
+static void test_size_and_dir_text_units(void)
+{
+    printf("\n--- Test: INMSIZE / INMLSIZE / INMDIR text units ---\n");
+
+    static const struct { uint64_t size; uint32_t dir; uint64_t want; } cases[] = {
+        { 1842720ULL,          10, 1842720ULL },
+        { 0xFFFFFFFFULL,        0, 0xFFFFFFFFULL },
+        { 0x100000000ULL,       0, 0x100000000ULL },   /* 4 GB exactly: 4096 MB */
+        { 5000000001ULL,        0, 4769ULL << 20 },    /* > 4 GB: INMLSIZE in whole MB, rounded up */
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        FILE *tmp = tmpfile();
+        netdata_writer_t writer;
+        netdata_writer_init(&writer, tmp);
+        netdata_writer_emit_inmr01(&writer, "POK", "CCW");
+        netdata_writer_emit_inmr02(&writer, "SIZE.TEST", DSORG_PO, RECFM_F | RECFM_B, 80, 27920,
+                                   cases[i].size, cases[i].dir);
+        netdata_writer_emit_inmr06(&writer);
+        netdata_writer_flush(&writer);
+
+        rewind(tmp);
+        uint8_t buffer[4096];
+        size_t nread = fread(buffer, 1, sizeof(buffer), tmp);
+        fclose(tmp);
+
+        netdata_info_t info;
+        int rc = netdata_parse_header(buffer, nread, &info);
+        TEST_ASSERT(rc == 0, "Header with size text unit parses");
+        TEST_ASSERT(info.size_bytes == cases[i].want, "Parsed size matches the transmitted size");
+        TEST_ASSERT(info.dir_blocks == cases[i].dir, "Parsed INMDIR matches the transmitted directory blocks");
+        TEST_ASSERT(info.blksize == 27920 && info.lrecl == 80, "Attributes after the size text unit stay intact");
+    }
+}
+
 int main(void)
 {
     printf("==================================================\n");
@@ -187,6 +222,7 @@ int main(void)
     test_format_helpers();
     test_netdata_encode_decode();
     test_spanned_records();
+    test_size_and_dir_text_units();
 
     printf("\n==================================================\n");
     printf(" Test Results: %d / %d tests passed\n", g_tests_passed, g_tests_run);

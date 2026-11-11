@@ -170,6 +170,32 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
         }
     }
 
+    /* Approximate size in bytes (INMSIZE), as TRANSMIT reports for a PDS: the
+     * directory plus every member, each rounded up to whole blocks because a
+     * block never holds data of two members. The C runtime knows the record
+     * count of a member, so a seek to the end is cheap. */
+    uint64_t blk = blksize ? blksize : 1;
+    uint64_t size_bytes = ((uint64_t)dir_block_count * 256 + blk - 1) / blk * blk;
+    for (size_t m = 0; m < member_count; m++) {
+        if (members[m].is_alias) continue;
+        snprintf(alloc_cmd, sizeof(alloc_cmd), "alloc fi(MBRDD) da('%s(%s)') shr",
+                 src_dsn, members[m].name_ascii);
+        if (dynalloc_str(alloc_cmd, msg, sizeof(msg)) != 0) continue;
+        FILE *fsz = fopen("DD:MBRDD", "rb,type=record");
+        if (fsz) {
+            if (fseek(fsz, 0, SEEK_END) == 0) {
+                long nrecs = ftell(fsz);
+                if (nrecs > 0) {
+                    size_bytes += ((uint64_t)nrecs * lrecl + blk - 1) / blk * blk;
+                }
+            }
+            fclose(fsz);
+        }
+        dynalloc_str("free fi(MBRDD)", msg, sizeof(msg));
+    }
+    log_verbose("Estimated dataset size: %llu bytes (%zu directory blocks)",
+                (unsigned long long)size_bytes, dir_block_count);
+
     /* Step 3: Emit Netdata Transmission Control Records */
     /* INMR01 Transmission Header */
     if (netdata_writer_emit_inmr01(writer, "POK", get_current_hlq()) != 0) {
@@ -180,8 +206,8 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
     }
 
     /* INMR02 Dataset Attributes */
-    /* Size of a PDS/PDSE is not known up front; 0 tells RECEIVE to use its default */
-    if (netdata_writer_emit_inmr02(writer, src_dsn, dsorg, recfm, lrecl, blksize, 0) != 0) {
+    if (netdata_writer_emit_inmr02(writer, src_dsn, dsorg, recfm, lrecl, blksize, size_bytes,
+                                   (uint32_t)(dir_block_count > 0 ? dir_block_count : 1)) != 0) {
         log_error("Failed to emit INMR02 record");
         free(members);
         free(dir_blocks);

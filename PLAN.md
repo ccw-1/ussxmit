@@ -97,3 +97,5 @@ CFLAGS ?= -O2 -fzos-le-char-mode=ascii -D_EXT -D_XOPEN_SOURCE_EXTENDED=1 -I./inc
 | Restored PDS Member Integrity | Re-xmit & verify members (`MBR1`, `MBR2`) | Passed ✅ |
 | PDSE GOFF Program Object Stream | `ussxmit xmit "CCW.GO.PDSE" \| ussxmit inspect` | Passed ✅ |
 | Large sequential restore (736 MB, FBS 4160) | `ussxmit xmit DSN \| ussxmit receive NEW` + `cksum` compare | Passed ✅ (v1.1.0) |
+| PDS sized from INMSIZE/INMDIR (3 members, 1.7 MB) | `xmit PDS \| receive NEW` + member `cksum` | Passed ✅ (v1.2.0) |
+| Receive of a TSO TRANSMIT-made PDS stream (IEBCOPY, two INMR02) | `receive NEW < tso.xmi` + member `cksum` | Passed ✅ (v1.2.0) |

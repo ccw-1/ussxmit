@@ -98,11 +98,13 @@ Control records structure their attributes using Key-Length-Data (KLD) tuples:
 Key text units defined in [`include/netdata.h`](include/netdata.h:1):
 - `INMDSNAM` (`0x0002`): Dataset name qualifiers.
 - `INMMBR`   (`0x0003`): Member name.
-- `INMDIR`   (`0x000B`): Directory block count (for PDS).
+- `INMSECND` (`0x000B`): Secondary space quantity (defined, not used: TSO TRANSMIT does not send it).
+- `INMDIR`   (`0x000C`): Directory block count (for PDS). Written by `xmit` for PDS (used directory blocks) and used by `receive` for `dir(n)`.
 - `INMEXPDT` (`0x0022`): Expiration date.
 - `INMTERM`  (`0x0028`): Terminal transmission flag.
 - `INMUTILN` (`0x002B` / `0x1028`): Utility program name (`INMCOPY` / `IEBCOPY`).
-- `INMSIZE`  (`0x102C`): Approximate file size in bytes (numeric, 1-8 bytes; `0` = unknown). Written by `xmit` for sequential datasets (record count x `LRECL`) and used by `receive` to size the target allocation.
+- `INMSIZE`  (`0x102C`): Approximate file size in bytes (4 bytes; `0` = unknown). Written by `xmit` and used by `receive` to size the target allocation. TSO TRANSMIT reports used tracks x track capacity (sequential: blocks per track x `BLKSIZE`; PDS: 58786 bytes per 3390 track), so it is an upper bound of the data; `xmit` reports records x `LRECL` for sequential datasets and, for a PDS, the directory plus every member rounded up to whole blocks.
+- `INMLSIZE` (`0x8018`): File size in megabytes (4 bytes), written instead of `INMSIZE` above 4 GB; `receive` multiplies by 1 MB when `INMSIZE` is absent.
 - `INMDSORG` (`0x003C`): Dataset organization (`0x4000` = PS, `0x0200` = PO).
 - `INMRECFM` (`0x0049`): Record format (`0x80` = Fixed, `0x40` = Variable, `0x10` = Blocked, etc.).
 - `INMLRECL` (`0x0042`): Logical record length.
@@ -151,7 +153,7 @@ graph TD
    - Reads 256-byte directory blocks from `fopen("DD:PDSDIR", "rb,type=record")`.
    - Parses member entries, TTRs, user data (ISPF stats, program object metadata), and ALIAS flags (`C & 0x80`).
    - Probes the first member via `fldata()` to extract exact dataset `RECFM`, `LRECL`, and `BLKSIZE`.
-   - Emits `INMR01` and `INMR02` (`INMUTILN = IEBCOPY`, `INMDSORG = 0x0200`, `INMSIZE = 0` because a PDS size is not known up front).
+   - Emits `INMR01` and `INMR02` (`INMUTILN = IEBCOPY`, `INMDSORG = 0x0200`, `INMSIZE` and `INMDIR` set). The size comes from a pre-pass that seeks to the end of every non-alias member (`fseek`/`ftell` returns the record count) and sums `ceil(records x LRECL / BLKSIZE) x BLKSIZE` plus the directory.
    - Emits `COPYR1` header record (56 bytes, `00 CA 6D 0F...`) with 3390 track geometry.
    - Emits directory header block (276 bytes) and directory blocks (288 bytes each).
    - Streams member physical data blocks wrapped in 12-byte CKD headers `[0x00000000][CCHH][TTR_R][len]`, terminated with a 12-byte member EOF marker (`len = 0`). Aliases are preserved in directory blocks and skipped during physical data block emission.
@@ -167,12 +169,15 @@ graph TD
    - If `-f` / `--force` specified, invokes `dynalloc_delete_dsn()` to delete existing cataloged dataset.
    - Dynamically allocates target dataset via `BPXWDYN` (adding `dir(...)` for PDS). Space is sized like TSO RECEIVE:
      - `INMSIZE` > 0: `block(BLKSIZE) space(size/BLKSIZE, size/BLKSIZE/4) release` (primary from the sender's size, secondaries for underestimates, unused space released on close).
-     - `INMSIZE` absent or 0 (XMIT370 streams, PDS/PDSE): `cyl space(1,500) release`.
+     - `INMSIZE` absent or 0 (XMIT370 streams): `cyl space(1,500) release`.
+     - PDS/PDSE use the same rules; `dir(INMDIR)` (default 20 blocks without `INMDIR`).
+     - TSO streams of a PDS carry two `INMR02` records (`IEBCOPY` describing the PDS, then `INMCOPY` describing the intermediate unload dataset); only the first is used.
      - The constants are `RECV_*` macros in [`src/receive.c`](src/receive.c:1).
 5. **Sequential Restoration (`DSORG=PS`)**:
    - Opens target via `fopen("DD:RCVOUT", "wb,type=record")` and writes records directly.
 6. **Partitioned Restoration (`DSORG=PO`)** ([`src/receive.c`](src/receive.c:1)):
    - Identifies `COPYR1` and directory records (276/288 bytes) and extracts member queue.
+   - A real IEBCOPY unload packs whole blocks into one record, so fixed-length members are written in `LRECL` pieces (record I/O takes one record per write). Variable-length (BDW/RDW) blocks of TSO-made streams are not decoded yet.
    - For each CKD block: allocates `alloc fi(RCVMEM) da('TARGET(MEM)') shr`, writes data blocks via `fopen("DD:RCVMEM", "wb,type=record")`.
    - On 12-byte EOF block (`len = 0`): closes member file, frees DD, and advances to next member.
 7. On `INMR06`: closes all open handles and frees allocated DDs.
