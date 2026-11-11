@@ -31,6 +31,20 @@ static uint32_t read_u32_be(const uint8_t *p, size_t len)
     return val;
 }
 
+static uint64_t read_u64_be(const uint8_t *p, size_t len)
+{
+    /* Numeric text units are 1 to 8 bytes; longer fields use the low-order 8 */
+    if (len > 8) {
+        p += len - 8;
+        len = 8;
+    }
+    uint64_t val = 0;
+    for (size_t i = 0; i < len; i++) {
+        val = (val << 8) | (uint64_t)p[i];
+    }
+    return val;
+}
+
 static void write_u16_be(uint8_t *p, uint16_t val)
 {
     p[0] = (uint8_t)(val >> 8);
@@ -43,6 +57,19 @@ static void write_u32_be(uint8_t *p, uint32_t val)
     p[1] = (uint8_t)((val >> 16) & 0xFF);
     p[2] = (uint8_t)((val >> 8) & 0xFF);
     p[3] = (uint8_t)(val & 0xFF);
+}
+
+/* Append an INMSIZE text unit (key, count 1, length, value); returns bytes written */
+static size_t write_inmsize_tu(uint8_t *p, uint64_t size_bytes)
+{
+    size_t vlen = (size_bytes > 0xFFFFFFFFULL) ? 8 : 4;
+    write_u16_be(p, INMSIZE_KEY);
+    write_u16_be(p + 2, 1);
+    write_u16_be(p + 4, (uint16_t)vlen);
+    for (size_t i = 0; i < vlen; i++) {
+        p[6 + i] = (uint8_t)(size_bytes >> (8 * (vlen - 1 - i)));
+    }
+    return 6 + vlen;
 }
 
 /* ================================================================== */
@@ -207,7 +234,7 @@ int netdata_writer_emit_inmr01(netdata_writer_t *w, const char *node, const char
     return netdata_writer_emit_record(w, true, buf, off);
 }
 
-int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize)
+int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize, uint64_t size_bytes)
 {
     uint8_t buf[256];
     size_t off = 0;
@@ -228,11 +255,8 @@ int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t ds
     write_u16_be(buf + off, 7);      off += 2;
     memcpy(buf + off, util, 7); off += 7;
 
-    /* TU 0x102C: Flags (0x00 0x01 0x80 0x00) */
-    write_u16_be(buf + off, 0x102C); off += 2;
-    write_u16_be(buf + off, 1);      off += 2;
-    write_u16_be(buf + off, 4);      off += 2;
-    buf[off++] = 0x00; buf[off++] = 0x01; buf[off++] = 0x80; buf[off++] = 0x00;
+    /* TU 0x102C: INMSIZE, approximate file size in bytes (0 = unknown) */
+    off += write_inmsize_tu(buf + off, size_bytes);
 
     /* TU 0x003C: DSORG (2 bytes) */
     write_u16_be(buf + off, 0x003C); off += 2;
@@ -292,7 +316,7 @@ int netdata_writer_emit_inmr02(netdata_writer_t *w, const char *dsn, uint16_t ds
     return netdata_writer_emit_record(w, true, buf, off);
 }
 
-int netdata_writer_emit_inmr03(netdata_writer_t *w, uint16_t dsorg, uint8_t recfm, uint32_t lrecl)
+int netdata_writer_emit_inmr03(netdata_writer_t *w, uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint64_t size_bytes)
 {
     uint8_t buf[128];
     size_t off = 0;
@@ -300,10 +324,7 @@ int netdata_writer_emit_inmr03(netdata_writer_t *w, uint16_t dsorg, uint8_t recf
     memcpy(buf + off, inmr03_eye, 6);
     off += 6;
 
-    write_u16_be(buf + off, 0x102C); off += 2;
-    write_u16_be(buf + off, 1);      off += 2;
-    write_u16_be(buf + off, 4);      off += 2;
-    buf[off++] = 0x00; buf[off++] = 0x01; buf[off++] = 0x80; buf[off++] = 0x00;
+    off += write_inmsize_tu(buf + off, size_bytes);
 
     write_u16_be(buf + off, 0x003C); off += 2;
     write_u16_be(buf + off, 1);      off += 2;
@@ -438,6 +459,8 @@ void netdata_parse_text_units(const uint8_t *p, size_t len, netdata_info_t *info
                     info->recfm = val[0];
                 } else if (key == INMBLKSIZE_KEY) {
                     info->blksize = read_u32_be(val, tlen);
+                } else if (key == INMSIZE_KEY) {
+                    info->size_bytes = read_u64_be(val, tlen);
                 } else if (key == 0x1028 && tlen < sizeof(info->utility_name)) {
                     memcpy(info->utility_name, val, tlen);
                     info->utility_name[tlen] = '\0';

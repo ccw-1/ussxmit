@@ -89,8 +89,20 @@ int do_xmit(const ussxmit_opts_t *opts)
         return RC_ERR_STREAM;
     }
 
+    /* Approximate size in bytes (INMSIZE): the C runtime knows the record count
+     * of a sequential dataset, so a seek to the end is cheap. 0 = unknown. */
+    uint64_t size_bytes = 0;
+    if (fseek(fp, 0, SEEK_END) == 0) {
+        long nrecs = ftell(fp);
+        if (nrecs > 0) {
+            size_bytes = (uint64_t)nrecs * lrecl;
+        }
+        rewind(fp);
+    }
+    log_verbose("Estimated dataset size: %llu bytes", (unsigned long long)size_bytes);
+
     /* Emit INMR02 Dataset Utility / Attributes */
-    if (netdata_writer_emit_inmr02(&writer, src_dsn, dsorg, recfm, lrecl, blksize) != 0) {
+    if (netdata_writer_emit_inmr02(&writer, src_dsn, dsorg, recfm, lrecl, blksize, size_bytes) != 0) {
         log_error("Failed to emit INMR02 record");
         fclose(fp);
         dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));

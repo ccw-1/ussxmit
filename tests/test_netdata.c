@@ -78,7 +78,7 @@ static void test_netdata_encode_decode(void)
     int rc = netdata_writer_emit_inmr01(&writer, "POKNODE", "TESTUSER");
     TEST_ASSERT(rc == 0, "Emit INMR01 transmission header");
 
-    rc = netdata_writer_emit_inmr02(&writer, "MY.TEST.SEQDSN", DSORG_PS, RECFM_F | RECFM_B, 80, 3120);
+    rc = netdata_writer_emit_inmr02(&writer, "MY.TEST.SEQDSN", DSORG_PS, RECFM_F | RECFM_B, 80, 3120, 0);
     TEST_ASSERT(rc == 0, "Emit INMR02 dataset attributes");
 
     const char test_line[] = "Line 1: Sample data record payload for test verification.";
@@ -142,7 +142,7 @@ static void test_spanned_records(void)
     netdata_writer_init(&writer, tmp);
 
     netdata_writer_emit_inmr01(&writer, "POK", "CCW");
-    netdata_writer_emit_inmr02(&writer, "SPANNED.DATA", DSORG_PS, RECFM_V | RECFM_B, 1000, 32760);
+    netdata_writer_emit_inmr02(&writer, "SPANNED.DATA", DSORG_PS, RECFM_V | RECFM_B, 1000, 32760, 0);
 
     /* Generate 600-byte test pattern */
     uint8_t large_payload[600];

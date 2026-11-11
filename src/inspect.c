@@ -83,6 +83,9 @@ int do_inspect(const ussxmit_opts_t *opts)
     printf(" Record Format: %s\n", recfm_str);
     printf(" Record Length: %u\n", info.lrecl);
     printf(" Block Size   : %u\n", info.blksize);
+    if (info.size_bytes > 0) {
+        printf(" Size (bytes) : %llu\n", (unsigned long long)info.size_bytes);
+    }
     if (info.dir_blocks > 0) {
         printf(" Directory Blk: %u\n", info.dir_blocks);
     }

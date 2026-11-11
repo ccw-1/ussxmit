@@ -15,6 +15,12 @@
 
 #define MAX_RECV_MEMBERS 4096
 
+/* Space allocation when restoring (see INMR02 handling) */
+#define RECV_MAX_SPACE_UNITS       16777215u /* largest primary/secondary BPXWDYN accepts */
+#define RECV_SECONDARY_DIVISOR     4u        /* secondary extent = 1/4 of the primary */
+#define RECV_DEFAULT_PRIMARY_CYL   1u        /* used when the sender gave no size */
+#define RECV_DEFAULT_SECONDARY_CYL 500u
+
 static const uint8_t inmr01_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF1};
 static const uint8_t inmr02_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF2};
 static const uint8_t inmr06_eye[6] = {0xC9, 0xD5, 0xD4, 0xD9, 0xF0, 0xF6};
@@ -251,13 +257,30 @@ static int receive_record_cb(bool is_control, const uint8_t *data, size_t len, v
                 snprintf(dir_str, sizeof(dir_str), " dir(%u)", dir_blk);
             }
 
-            /* The stream carries no reliable size, so allocate a small primary
-             * and large secondary extents (up to 16 x 500 cylinders) and give
-             * back unused space on close. */
-            char alloc_cmd[256];
+            /* Size the target like TSO RECEIVE does: from INMSIZE (approximate
+             * bytes) when the sender supplied it, in units of blocks so the
+             * system accounts for track capacity itself. Further data goes
+             * into secondary extents, and unused space is released on close. */
+            char space_str[96];
+            if (st->info.size_bytes > 0) {
+                uint64_t blocks = (st->info.size_bytes + blksize - 1) / blksize;
+                uint64_t secondary = blocks / RECV_SECONDARY_DIVISOR;
+                if (blocks > RECV_MAX_SPACE_UNITS) blocks = RECV_MAX_SPACE_UNITS;
+                if (secondary < 1) secondary = 1;
+                if (secondary > RECV_MAX_SPACE_UNITS) secondary = RECV_MAX_SPACE_UNITS;
+                snprintf(space_str, sizeof(space_str), "block(%u) space(%llu,%llu) release",
+                         blksize, (unsigned long long)blocks, (unsigned long long)secondary);
+            } else {
+                /* No size in the stream (e.g. XMIT370): small primary, large
+                 * secondary extents. */
+                snprintf(space_str, sizeof(space_str), "cyl space(%u,%u) release",
+                         RECV_DEFAULT_PRIMARY_CYL, RECV_DEFAULT_SECONDARY_CYL);
+            }
+
+            char alloc_cmd[320];
             snprintf(alloc_cmd, sizeof(alloc_cmd),
-                     "alloc fi(RCVOUT) da('%s') new catalog cyl space(1,500) release%s recfm(%s) lrecl(%u) blksize(%u)",
-                     st->target_dsn, dir_str, recfm_str, lrecl, blksize);
+                     "alloc fi(RCVOUT) da('%s') new catalog %s%s recfm(%s) lrecl(%u) blksize(%u)",
+                     st->target_dsn, space_str, dir_str, recfm_str, lrecl, blksize);
 
             log_verbose("Allocating target dataset: %s", alloc_cmd);
             int rc = dynalloc_str(alloc_cmd, msg, sizeof(msg));

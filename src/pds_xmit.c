@@ -180,7 +180,8 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
     }
 
     /* INMR02 Dataset Attributes */
-    if (netdata_writer_emit_inmr02(writer, src_dsn, dsorg, recfm, lrecl, blksize) != 0) {
+    /* Size of a PDS/PDSE is not known up front; 0 tells RECEIVE to use its default */
+    if (netdata_writer_emit_inmr02(writer, src_dsn, dsorg, recfm, lrecl, blksize, 0) != 0) {
         log_error("Failed to emit INMR02 record");
         free(members);
         free(dir_blocks);
