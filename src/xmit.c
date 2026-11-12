@@ -81,8 +81,17 @@ int do_xmit(const ussxmit_opts_t *opts)
     if (dsorg == DSORG_PO) {
         fclose(fp);
         dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
-        if (info.__dsorgPDSE) return xmit_pdse_stream(opts, src_dsn, &writer);
-        return xmit_pds_stream(opts, src_dsn, dsorg, recfm, lrecl, blksize, &writer);
+        if (info.__dsorgPDSE) {
+            /* Data libraries (RECFM F or V) are unloaded natively; program
+             * libraries (RECFM U) and anything unusual go through IEBCOPY.
+             * USSXMIT_IEBCOPY=1 forces IEBCOPY. */
+            if (!getenv("USSXMIT_IEBCOPY")) {
+                int prc = xmit_pds_stream(opts, src_dsn, dsorg, recfm, lrecl, blksize, true, &writer);
+                if (prc != XMIT_FALLBACK) return prc;
+            }
+            return xmit_pdse_stream(opts, src_dsn, &writer);
+        }
+        return xmit_pds_stream(opts, src_dsn, dsorg, recfm, lrecl, blksize, false, &writer);
     }
 
     /* Emit INMR01 Transmission Header */

@@ -131,7 +131,18 @@ TSO TRANSMIT of a PDSE (data library or program-object library) uses the same fr
 - **INMR02 `INMTYPE` (`0x8012`)**: `0x00` PDS, `0x80` data library, `0x40` program library. `INMLRECL` 0 and `INMRECFM` `0xC000` for RECFM U. `INMSIZE` is the allocated size of the PDSE, not the stream size.
 - Directory units are 276 bytes as for a PDS, but the count field starts with `0x08`; the directory ends with a 12-byte terminator that starts with `0x88`.
 - The member data are no DASD track images. Per member there are two groups of units: (A) data blocks with header flag `0x00`, ended by a terminator with flag `0x80`; (B) an `IGWFAHR` attribute record with header flag `0x04`, ended by a terminator with flag `0x84`. Program objects use 4096-byte `IEWPLMH` pages. A data PDSE has a trailing dataset-level record with flag `0x02`, ended by `0xC2`.
-- The format is only produced and consumed reliably by IEBCOPY itself, so `ussxmit` does not generate or interpret it: the stream records are the records of an IEBCOPY unload data set (`RECFM=VS LRECL=32756 BLKSIZE=3120`) passed through unchanged.
+- Program-object libraries (`0x11`, RECFM U) are only produced and consumed reliably by IEBCOPY, so `ussxmit` does not interpret them: the stream records are the records of an IEBCOPY unload data set (`RECFM=VS LRECL=32756 BLKSIZE=3120`) passed through unchanged (see 4.1/4.2).
+
+#### Data PDSE layout (handled natively since 1.5.0)
+
+Verified byte for byte against IEBCOPY output for FB, VB, ISPF statistics, aliases, empty members and a 1375 member library.
+
+- **Records**: `COPYR1` (56), `COPYR2` (276), directory units (276 each, count field byte 0 `0x08`), 12-byte terminator `88 00 ...`. Then per non-alias member in ascending TTR order: data units (flag `0x00`), end marker (`0x80`, length 0), attribute unit (`0x04`, 279 bytes), end marker (`0x84`). After the last member a dataset unit (`0x02`, 160 bytes) and a `0xC2` marker, both carrying the last member's TTR. A trailing `0x40` run is netdata card padding.
+- **Unit header** (12 bytes): `[flag][00 00 00][00 00 TT(2)][R][len(3)]`. The CCHH field holds the TT part of the member id, the R byte the R part.
+- **Member id**: IEBCOPY numbers the members `2 x directory TTR + 1` (24 bit). The directory entries of an unload carry that id instead of the TTR the DD read gives.
+- **Directory**: `fopen("DD:PDSDIR","rb,type=record")` on a PDSE returns the PDS entry layout. For the unload the used count of the last block stops right after the 8-byte `FF` end marker, followed by `00 00 01 00` (marker TTR 0 mapped like a member id), and all bytes past the used count are zeroed. Aliases carry the primary member's id and have no data units. ISPF statistics are directory user data.
+- **Constants**: `COPYR1`, `COPYR2` and the 279/160 byte attribute units are the same for every data PDSE ([`include/pdse_unload.h`](include/pdse_unload.h:1)); only `COPYR1` bytes 4-10 vary (DSORG, BLKSIZE, LRECL, RECFM). They do not depend on RECFM, LRECL, ISPF statistics or aliases.
+- **Member data**: `fopen("DD:MBRDD","rb,type=blocked")` + `fread` returns exactly the unloaded blocks (BLKSIZE-filled, short last block; VB blocks with BDW/RDW).
 
 ## 4. Pure In-Process Execution Architecture
 
@@ -181,11 +192,13 @@ graph TD
    - The member EOF header rides with the last block only if the record stays within `min(source BLKSIZE, 3120)`; otherwise (and for empty members) it is a record of its own. Real IEBCOPY reload rejects streams that attach it to a full-size block (IEB188I, RC 8).
    - Emits `INMR06` trailer, flushes, and frees DDs.
 
-7. **PDSE (`fldata().__dsorgPDSE`)** ([`src/pds_xmit.c`](src/pds_xmit.c:1) `xmit_pdse_stream`, [`src/iebcopy.c`](src/iebcopy.c:1)):
-   - Allocates a temporary unload data set (`<HLQ>.XMUNL.*`, VS 32756/3120) and runs IEBCOPY `COPY` from the PDSE into it.
-   - IEBCOPY is authorized (AC=1): LINKing it through SVC 6 from a USS process kills the process (SIGKILL). It runs under the TSO terminal monitor program instead: `tsocmd "EXEC 'tmp.rexx' EXEC"`, where a temporary REXX exec allocates `SYSUT1/SYSUT2/SYSIN/SYSPRINT`, `CALL`s `SYS1.LINKLIB(IEBCOPY)` and frees the DDs. (Allocations made by separate `tsocmd` calls do not persist, hence the exec.) The SYSPRINT data set is read back; its `IEB147I ... HIGHEST SEVERITY CODE` is the return code (0 and 4 succeed).
-   - Reads COPYR1 for DSORG/RECFM/LRECL/BLKSIZE and the library type (`INMTYPE` 0x80 or 0x40), sums the record lengths for `INMSIZE`, emits `INMR01`, `INMR02` (IEBCOPY), `INMR02` (INMCOPY), `INMR03`, then every unload record unchanged as a data record, then `INMR06`. The temporary data sets (unload, exec, SYSIN, SYSPRINT) are deleted.
-   - This is the one case where `ussxmit` uses temporary DASD.
+7. **PDSE (`fldata().__dsorgPDSE`)**:
+   - **Data library, native** ([`src/pds_xmit.c`](src/pds_xmit.c:1) `xmit_pds_stream` with `pdse`, 1.5.0): the stream of 3.6 is built directly from the directory and member reads, no IEBCOPY and no temporary DASD. `INMTYPE` is `0x80`. The result is byte identical to the IEBCOPY stream. It returns `XMIT_FALLBACK` (before any output) when the first-member probe shows RECFM U, the library has no members, or the member/directory buffers are full; `xmit.c` then uses the IEBCOPY path below. `USSXMIT_IEBCOPY=1` forces the IEBCOPY path.
+   - **IEBCOPY path** ([`src/pds_xmit.c`](src/pds_xmit.c:1) `xmit_pdse_stream`, [`src/iebcopy.c`](src/iebcopy.c:1)), used for program-object libraries and as fallback:
+     - Allocates a temporary unload data set (`<HLQ>.XMUNL.*`, VS 32756/3120) and runs IEBCOPY `COPY` from the PDSE into it.
+     - IEBCOPY is authorized (AC=1): LINKing it through SVC 6 from a USS process kills the process (SIGKILL). It runs under the TSO terminal monitor program instead: `tsocmd "EXEC 'tmp.rexx' EXEC"`, where a temporary REXX exec allocates `SYSUT1/SYSUT2/SYSIN/SYSPRINT`, `CALL`s `SYS1.LINKLIB(IEBCOPY)` and frees the DDs. (Allocations made by separate `tsocmd` calls do not persist, hence the exec.) The SYSPRINT data set is read back; its `IEB147I ... HIGHEST SEVERITY CODE` is the return code (0 and 4 succeed).
+     - Reads COPYR1 for DSORG/RECFM/LRECL/BLKSIZE and the library type (`INMTYPE` 0x80 or 0x40), sums the record lengths for `INMSIZE`, emits `INMR01`, `INMR02` (IEBCOPY), `INMR02` (INMCOPY), `INMR03`, then every unload record unchanged as a data record, then `INMR06`. The temporary data sets (unload, exec, SYSIN, SYSPRINT) are deleted.
+     - Only this path uses temporary DASD.
 
 ### 4.2. `receive` Operation
 1. Initializes `netdata_reader_t` with record dispatcher callback `receive_record_cb`.
@@ -210,8 +223,9 @@ graph TD
    - A zero-length header ends the member: the member file is closed and its DD freed.
 7. **PDSE restoration** (`COPYR1` byte 0 has bit `0x11`; [`src/receive.c`](src/receive.c:1), [`src/iebcopy.c`](src/iebcopy.c:1)):
    - The `PO` target allocation is deferred until `COPYR1` has been seen: a PDSE stream allocates the target with `dsntype(library)` (RECFM U without `lrecl`).
-   - All data records go unchanged to a temporary unload data set (`<HLQ>.UNLD.*`, VS 32756/3120).
-   - On `INMR06` IEBCOPY copies the unload data set into the new PDSE (same `tsocmd`/REXX mechanism as `xmit`, see 4.1); a return code above 4 gives exit code 5. The temporary data set is deleted.
+   - **Native** (1.5.0): a data library (`COPYR1` byte 0 `0x01`, not RECFM U, `USSXMIT_IEBCOPY` unset) is written member by member like a PDS. The member is found by the header's member id (TT, R) against the directory TTRs; a `0x80` marker completes it (and creates an empty member), `0x04`/`0x02` units are skipped, `0xC2` ends the data. At `INMR06` the member count must match the directory, otherwise exit 4.
+   - **Switch to IEBCOPY**: writing members with `fopen` cannot recreate aliases or ISPF statistics. The records up to the end of the directory are therefore buffered; if the directory has an alias or user data, they are replayed into a temporary unload data set and the rest of the stream follows unchanged (IEBCOPY path below). Otherwise the buffer is dropped.
+   - **IEBCOPY path** (program-object libraries, switch, override): all data records go unchanged to a temporary unload data set (`<HLQ>.UNLD.*`, VS 32756/3120); on `INMR06` IEBCOPY copies it into the new PDSE (same `tsocmd`/REXX mechanism as `xmit`, see 4.1); a return code above 4 gives exit code 5. The temporary data set is deleted.
    - Outside the IEBCOPY path, a data block without an owning member is an error (exit 4), not a warning.
 8. On `INMR06`: closes all open handles and frees allocated DDs.
 

@@ -49,6 +49,13 @@ for m in MEM1 MEM2 MEM3; do
     [ "$a" = "$b" ] || { echo "PDSE member $m differs"; exit 1; }
 done
 
+echo "Test 9: native and IEBCOPY PDSE streams are identical (member records only)"
+$BIN xmit "CCW.TESTPDSE" > /tmp/ussxmit_pdse_n.$$
+USSXMIT_IEBCOPY=1 $BIN xmit "CCW.TESTPDSE" > /tmp/ussxmit_pdse_i.$$
+n=$(cmp -l /tmp/ussxmit_pdse_n.$$ /tmp/ussxmit_pdse_i.$$ | awk '$1>500' | wc -l)
+rm -f /tmp/ussxmit_pdse_n.$$ /tmp/ussxmit_pdse_i.$$
+[ "$n" -eq 0 ] || { echo "native and IEBCOPY PDSE streams differ in $n bytes"; exit 1; }
+
 echo ""
 echo "=================================================="
 echo " All Integration Tests Passed Successfully!"

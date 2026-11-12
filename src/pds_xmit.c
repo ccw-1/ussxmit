@@ -13,6 +13,7 @@
 #include "pds_xmit.h"
 #include "dynalloc.h"
 #include "iebcopy.h"
+#include "pdse_unload.h"
 #include "utils.h"
 
 #define MAX_MEMBERS 4096
@@ -79,9 +80,89 @@ static int member_ttr_cmp(const void *a, const void *b)
     return memcmp(((const pds_member_entry_t *)a)->ttr, ((const pds_member_entry_t *)b)->ttr, 3);
 }
 
+/* 12-byte unit header of a PDSE unload: flag, 3 zero bytes, CCHH (CC=0, HH=TT of
+ * the member's directory TTR), R, 3-byte length */
+static void pdse_header(uint8_t *h, uint8_t flag, const uint8_t ttr[3], size_t len)
+{
+    memset(h, 0, 12);
+    h[0] = flag;
+    h[6] = ttr[0]; h[7] = ttr[1];
+    h[8] = ttr[2];
+    h[9] = (len >> 16) & 0xFF; h[10] = (len >> 8) & 0xFF; h[11] = len & 0xFF;
+}
+
+/* Member data of a PDSE data library: per non-alias member in TTR order the
+ * data blocks, an end marker, the (constant) attribute record and its end
+ * marker; the dataset attribute record and the end of the unload follow. */
+static int emit_pdse_members(netdata_writer_t *w, const char *src_dsn,
+                             const pds_member_entry_t *members, size_t count,
+                             size_t *total_blocks)
+{
+    char cmd[256];
+    char msg[256];
+    uint8_t *buf = malloc(12 + 65536);
+    uint8_t last_ttr[3] = {0, 0, 0};
+    int rc = 0;
+    if (!buf) return -1;
+
+    for (size_t m = 0; m < count && rc == 0; m++) {
+        const pds_member_entry_t *mbr = &members[m];
+        if (mbr->is_alias) continue;
+
+        snprintf(cmd, sizeof(cmd), "alloc fi(MBRDD) da('%s(%s)') shr", src_dsn, mbr->name_ascii);
+        if (dynalloc_str(cmd, msg, sizeof(msg)) != 0) {
+            log_error("Failed to allocate member '%s': %s", mbr->name_ascii, msg);
+            rc = -1;
+            break;
+        }
+        FILE *fmem = fopen("DD:MBRDD", "rb,type=blocked");
+        if (!fmem) {
+            log_error("Failed to open member '%s': %s", mbr->name_ascii, strerror(errno));
+            dynalloc_str("free fi(MBRDD)", msg, sizeof(msg));
+            rc = -1;
+            break;
+        }
+
+        size_t n;
+        size_t nblocks = 0;
+        while ((n = fread(buf + 12, 1, 65536, fmem)) > 0) {
+            pdse_header(buf, PDSE_FLAG_DATA, mbr->ttr, n);
+            if (emit_unit(w, buf, 12 + n) != 0) { rc = -1; break; }
+            nblocks++;
+        }
+        fclose(fmem);
+        dynalloc_str("free fi(MBRDD)", msg, sizeof(msg));
+        if (rc != 0) break;
+
+        pdse_header(buf, PDSE_FLAG_END_DATA, mbr->ttr, 0);
+        if (emit_unit(w, buf, 12) != 0) { rc = -1; break; }
+        pdse_header(buf, PDSE_FLAG_ATTR, mbr->ttr, sizeof(pdse_member_attr));
+        memcpy(buf + 12, pdse_member_attr, sizeof(pdse_member_attr));
+        if (emit_unit(w, buf, 12 + sizeof(pdse_member_attr)) != 0) { rc = -1; break; }
+        pdse_header(buf, PDSE_FLAG_END_ATTR, mbr->ttr, 0);
+        if (emit_unit(w, buf, 12) != 0) { rc = -1; break; }
+
+        memcpy(last_ttr, mbr->ttr, 3);
+        *total_blocks += nblocks;
+        log_verbose("Streamed member '%s' (%zu blocks)", mbr->name_ascii, nblocks);
+    }
+
+    if (rc == 0) {
+        pdse_header(buf, PDSE_FLAG_DSATTR, last_ttr, sizeof(pdse_dataset_attr));
+        memcpy(buf + 12, pdse_dataset_attr, sizeof(pdse_dataset_attr));
+        if (emit_unit(w, buf, 12 + sizeof(pdse_dataset_attr)) != 0) rc = -1;
+    }
+    if (rc == 0) {
+        pdse_header(buf, PDSE_FLAG_END_DSATTR, last_ttr, 0);
+        if (emit_unit(w, buf, 12) != 0) rc = -1;
+    }
+    free(buf);
+    return rc;
+}
+
 int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
                     uint16_t dsorg, uint8_t recfm, uint32_t lrecl, uint32_t blksize,
-                    netdata_writer_t *writer)
+                    bool pdse, netdata_writer_t *writer)
 {
     char msg[256];
     char alloc_cmd[256];
@@ -142,6 +223,31 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
 
     log_verbose("Read %zu directory blocks from %s", dir_block_count, src_dsn);
 
+    /* A PDSE directory read through the access method differs from the one in
+     * IEBCOPY's unload: the member id (TTR) in the unload is 2 * TTR + 1, and the
+     * used count of the block with the end marker stops after the 8-byte marker. */
+    if (pdse) {
+        for (size_t b = 0; b < dir_block_count; b++) {
+            uint8_t *blk = dir_blocks[b];
+            uint16_t used = (blk[0] << 8) | blk[1];
+            if (used > 256) used = 256;
+            memset(blk + used, 0, 256 - used);      /* bytes past the used count are stale */
+            size_t off = 2;
+            while (off + 12 <= used) {
+                if (blk[off] == 0xFF) {
+                    blk[0] = ((off + 8) >> 8) & 0xFF; blk[1] = (off + 8) & 0xFF;
+                    memset(blk + off + 8, 0, 256 - (off + 8));
+                    blk[off + 10] = 0x01;           /* the marker's TTR 0, mapped like the members' */
+                    break;
+                }
+                uint32_t id = ((uint32_t)blk[off + 8] << 16) | ((uint32_t)blk[off + 9] << 8) | blk[off + 10];
+                id = id * 2 + 1;
+                blk[off + 8] = (id >> 16) & 0xFF; blk[off + 9] = (id >> 8) & 0xFF; blk[off + 10] = id & 0xFF;
+                off += 12 + (blk[off + 11] & 0x1F) * 2;
+            }
+        }
+    }
+
     /* Step 2: Parse members from directory blocks */
     pds_member_entry_t *members = malloc(MAX_MEMBERS * sizeof(pds_member_entry_t));
     if (!members) {
@@ -200,6 +306,7 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
 
     log_info("Discovered %zu members in %s", member_count, src_dsn);
 
+
     /* Probe first member to extract exact dataset RECFM, LRECL, and BLKSIZE */
     if (member_count > 0) {
         char probe_cmd[256];
@@ -234,6 +341,17 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
             }
             dynalloc_str("free fi(PROBEDD)", probe_msg, sizeof(probe_msg));
         }
+    }
+
+    /* The native PDSE unload covers data libraries (RECFM F or V, known from the
+     * member: the directory reports RECFM U) that fit the buffers; program
+     * libraries and anything else are left to IEBCOPY. Nothing has been
+     * written to the stream yet. */
+    if (pdse && ((recfm & RECFM_U) == RECFM_U || member_count == 0 ||
+                 member_count >= MAX_MEMBERS || dir_block_count >= MAX_DIR_BLOCKS)) {
+        free(members);
+        free(dir_blocks);
+        return XMIT_FALLBACK;
     }
 
     /* Approximate size in bytes (INMSIZE), as TRANSMIT reports for a PDS: the
@@ -273,6 +391,7 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
 
     /* INMR02 #1 describes the PDS (IEBCOPY), INMR02 #2 the intermediate unload
      * dataset (INMCOPY, VBS 32756/3120) and INMR03 its records, as TRANSMIT does. */
+    writer->inmtype = pdse ? 0x80 : 0x00;
     if (netdata_writer_emit_inmr02_ex(writer, "IEBCOPY", src_dsn, dsorg, recfm, 0x00, lrecl, blksize,
                                       size_bytes, (uint32_t)(dir_block_count > 0 ? dir_block_count : 1)) != 0 ||
         netdata_writer_emit_inmr02_ex(writer, "INMCOPY", NULL, DSORG_PS, 0x48, 0x02, 32756, 3120,
@@ -337,6 +456,14 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
     }
     copyr1[49] = (lstar_tt >> 8) & 0xFF; copyr1[50] = lstar_tt & 0xFF; copyr1[51] = lstar_r;
 
+    if (pdse) {
+        memcpy(copyr1, pdse_copyr1, sizeof(copyr1));
+        copyr1[4] = (dsorg >> 8) & 0xFF; copyr1[5] = dsorg & 0xFF;
+        copyr1[6] = (blksize >> 8) & 0xFF; copyr1[7] = blksize & 0xFF;
+        uint32_t c1_lrecl = (recfm & RECFM_U) == RECFM_U ? 0 : lrecl;
+        copyr1[8] = (c1_lrecl >> 8) & 0xFF; copyr1[9] = c1_lrecl & 0xFF;
+        copyr1[10] = recfm;
+    }
     if (netdata_writer_emit_data(writer, copyr1, sizeof(copyr1)) != 0) {
         log_error("Failed to emit COPYR1 header record");
         free(members);
@@ -358,6 +485,7 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
     memcpy(copyr2 + 26, cc, 4);                          /* extent end CCHH */
     copyr2[30] = (ntracks >> 8) & 0xFF; copyr2[31] = ntracks & 0xFF;
 
+    if (pdse) memcpy(copyr2, pdse_copyr2, sizeof(copyr2));
     if (netdata_writer_emit_data(writer, copyr2, sizeof(copyr2)) != 0) {
         log_error("Failed to emit COPYR2 record");
         free(members);
@@ -375,6 +503,7 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
         memset(dirrec, 0, sizeof(dirrec));
         dirrec[9] = 0x08;
         dirrec[10] = 0x01; dirrec[11] = 0x00;
+        if (pdse) dirrec[0] = 0x08;
 
         memset(dirrec + 12, 0xFF, 8);
         if (b < dir_block_count) {
@@ -382,18 +511,30 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
             uint16_t used = (blk[0] << 8) | blk[1];
             if (used > 256) used = 256;
             size_t off = 2;
-            while (off + 12 <= used) {
+            while (off + 8 <= used) {
                 memcpy(dirrec + 12, blk + off, 8);   /* the end marker itself (FF..) is the key of the last block */
-                if (blk[off] == 0xFF) break;
+                if (blk[off] == 0xFF || off + 12 > used) break;
                 uint8_t c = blk[off + 11] & 0x1F;
                 off += 12 + c * 2;
             }
             memcpy(dirrec + 20, blk, 256);
         }
 
-        size_t reclen = 276 + (b + 1 == dir_used_count ? 12 : 0);   /* trailing zero count after the last block */
+        size_t reclen = 276 + (b + 1 == dir_used_count && !pdse ? 12 : 0);   /* trailing zero count after the last block */
         if (netdata_writer_emit_data(writer, dirrec, reclen) != 0) {
             log_error("Failed to emit directory record for block %zu", b + 1);
+            free(members);
+            free(dir_blocks);
+            return RC_ERR_STREAM;
+        }
+    }
+
+    if (pdse) {
+        uint8_t term[12];
+        memset(term, 0, sizeof(term));
+        term[0] = PDSE_FLAG_END_DIR;
+        if (netdata_writer_emit_data(writer, term, sizeof(term)) != 0) {
+            log_error("Failed to emit directory terminator");
             free(members);
             free(dir_blocks);
             return RC_ERR_STREAM;
@@ -416,7 +557,10 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
 
     size_t total_member_blocks = 0;
     int stream_rc = 0;
-    for (size_t m = 0; m < member_count && stream_rc == 0; m++) {
+    if (pdse && emit_pdse_members(writer, src_dsn, members, member_count, &total_member_blocks) != 0) {
+        stream_rc = -1;
+    }
+    for (size_t m = 0; !pdse && m < member_count && stream_rc == 0; m++) {
         pds_member_entry_t *mbr = &members[m];
         if (mbr->is_alias) {
             /* Skip aliases during physical data streaming */

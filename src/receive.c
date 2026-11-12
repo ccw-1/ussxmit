@@ -41,7 +41,7 @@ typedef struct {
     uint32_t cyl, head, ntracks;
 } recv_extent_t;
 
-enum { PDS_PHASE_COPYR1 = 0, PDS_PHASE_COPYR2, PDS_PHASE_DIR, PDS_PHASE_DATA };
+enum { PDS_PHASE_COPYR1 = 0, PDS_PHASE_COPYR2, PDS_PHASE_DIR, PDS_PHASE_DATA, PDS_PHASE_DONE };
 
 typedef struct {
     const ussxmit_opts_t *opts;
@@ -81,6 +81,17 @@ typedef struct {
     char                  unload_dsn[64];
     FILE                 *unload_fp;
     bool                  unload_allocated;
+
+    /* PDSE data libraries are written member by member unless the directory
+     * has aliases or user data (ISPF statistics), which only IEBCOPY can
+     * restore: the records up to the end of the directory are kept so they
+     * can be replayed into the IEBCOPY unload data set. */
+    bool                  pdse_native;
+    bool                  dir_has_extras;
+    bool                  switch_pending;
+    bool                  blk_skip;         /* the unit being collected is discarded */
+    uint8_t              *replay;
+    size_t                replay_len, replay_cap;
 } receive_state_t;
 
 static void close_current_member(receive_state_t *st)
@@ -157,6 +168,7 @@ static void parse_pds_directory_block(receive_state_t *st, const uint8_t *dirblk
         }
 
         uint8_t user_halfwords = c & 0x1F;
+        if (m->is_alias || user_halfwords) st->dir_has_extras = true;
         off += 12 + (user_halfwords * 2);
 
         if (!m->is_alias) {
@@ -247,11 +259,70 @@ static int select_member(receive_state_t *st, const uint8_t *h)
     return -1;
 }
 
+/* PDSE unload: the header holds the member's id in the TTR position (CCHH = 0, TT; R) */
+static int select_member_id(const receive_state_t *st, const uint8_t *h)
+{
+    for (size_t i = 0; i < st->member_count; i++) {
+        const recv_member_t *m = &st->members[i];
+        if (!m->done && m->ttr[0] == h[6] && m->ttr[1] == h[7] && m->ttr[2] == h[8]) return (int)i;
+    }
+    return -1;
+}
+
+/* Header of a unit of the PDSE member stream */
+static int process_pdse_header(receive_state_t *st)
+{
+    const uint8_t *h = st->hdr_buf;
+    uint8_t flag = h[0];
+    size_t len = ((size_t)h[9] << 16) | ((size_t)h[10] << 8) | h[11];
+
+    switch (flag) {
+    case 0x00:      /* data block */
+    case 0x80:      /* end of the data of a member */
+        if (st->cur_member < 0) st->cur_member = select_member_id(st, h);
+        if (st->cur_member < 0) {
+            log_error("Received a member unit without a matching directory entry");
+            st->error_code = RC_ERR_STREAM;
+            return -1;
+        }
+        if (flag == 0x80) {
+            const char *mname = st->members[st->cur_member].name_ascii;
+            if (!st->out_mem_fp && open_member_for_writing(st, mname) != 0) return -1;   /* empty member */
+            log_verbose("Completed member '%s'", mname);
+            close_current_member(st);
+            st->members[st->cur_member].done = true;
+            st->members_restored++;
+            st->cur_member = -1;
+            return 0;
+        }
+        if (len == 0) return 0;
+        break;
+    case 0x04:      /* member attributes */
+    case 0x02:      /* dataset attributes */
+        st->blk_skip = true;
+        break;
+    case 0x84:
+        return 0;
+    default:        /* 0xC2: end of the unload; anything else is padding */
+        st->pds_phase = PDS_PHASE_DONE;
+        return 0;
+    }
+    if (len > sizeof(st->blk_buf)) {
+        log_error("Member block of %zu bytes exceeds buffer", len);
+        st->error_code = RC_ERR_STREAM;
+        return -1;
+    }
+    st->blk_need = len;
+    st->blk_have = 0;
+    return 0;
+}
+
 /* Consume the member data stream: [12-byte header][block] units, which a
  * logical record boundary may cut anywhere. A zero-length header ends a member. */
 static int process_member_bytes(receive_state_t *st, const uint8_t *p, size_t len)
 {
     while (len > 0) {
+        if (st->pds_phase == PDS_PHASE_DONE) return 0;
         if (st->blk_need == 0) {
             size_t n = 12 - st->hdr_have;
             if (n > len) n = len;
@@ -267,11 +338,20 @@ static int process_member_bytes(receive_state_t *st, const uint8_t *p, size_t le
                 size_t dl = ((size_t)st->hdr_buf[10] << 8) | st->hdr_buf[11];
                 if (kl == 0 && dl == 0) {
                     st->pds_phase = PDS_PHASE_DATA;
+                    if (st->pdse_native && st->dir_has_extras) {
+                        st->switch_pending = true;      /* the caller replays the records into IEBCOPY */
+                        return 0;
+                    }
                 } else {
                     st->blk_kl = kl;
                     st->blk_need = kl + dl;
                     st->blk_have = 0;
                 }
+                continue;
+            }
+
+            if (st->pdse_native && st->pds_phase == PDS_PHASE_DATA) {
+                if (process_pdse_header(st) != 0) return -1;
                 continue;
             }
 
@@ -311,6 +391,10 @@ static int process_member_bytes(receive_state_t *st, const uint8_t *p, size_t le
                     parse_pds_directory_block(st, st->blk_buf + st->blk_kl, blen - st->blk_kl);
                     continue;
                 }
+                if (st->blk_skip) {
+                    st->blk_skip = false;
+                    continue;
+                }
                 if (write_member_block(st, st->blk_buf, blen) != 0) return -1;
             }
         }
@@ -318,61 +402,8 @@ static int process_member_bytes(receive_state_t *st, const uint8_t *p, size_t le
     return 0;
 }
 
-/* Allocate the PO target once COPYR1 tells whether the unload comes from a PDSE
- * (first byte of COPYR1: X'01' PDSE, X'10' PDSE with program objects; a PDS has
- * X'00'). A PDSE goes through IEBCOPY. */
-static int allocate_po_target(receive_state_t *st, const uint8_t *copyr1, size_t len)
+static int process_pds_record(receive_state_t *st, const uint8_t *data, size_t len)
 {
-    char msg[256];
-    char alloc_cmd[400];
-    bool pdse = len >= 4 && copyr1[1] == 0xCA && copyr1[2] == 0x6D && copyr1[3] == 0x0F &&
-                (copyr1[0] & 0x11) != 0;
-
-    snprintf(alloc_cmd, sizeof(alloc_cmd), "%s%s", st->po_alloc_cmd, pdse ? " dsntype(library)" : "");
-    log_verbose("Allocating target dataset: %s", alloc_cmd);
-    int rc = dynalloc_str(alloc_cmd, msg, sizeof(msg));
-    if (rc != 0) {
-        log_error("Failed allocating target dataset '%s': %s (rc=%d)", st->target_dsn, msg, rc);
-        st->error_code = RC_ERR_ALLOC_TGT;
-        return -1;
-    }
-    /* Members are allocated individually (PDS) or by IEBCOPY (PDSE) */
-    dynalloc_str("free fi(RCVOUT)", msg, sizeof(msg));
-    st->po_alloc_pending = false;
-
-    if (pdse) {
-        dynalloc_temp_dsn(st->unload_dsn, sizeof(st->unload_dsn), "UNLD");
-        if (iebcopy_alloc_unload(st->unload_dsn, "UNLOAD", st->info.size_bytes) != 0) {
-            st->error_code = RC_ERR_ALLOC_TGT;
-            return -1;
-        }
-        st->unload_allocated = true;
-        st->unload_fp = fopen("DD:UNLOAD", "wb,type=record");
-        if (!st->unload_fp) {
-            log_error("Failed to open the unload data set '%s': %s", st->unload_dsn, strerror(errno));
-            st->error_code = RC_ERR_ALLOC_TGT;
-            return -1;
-        }
-        st->use_iebcopy = true;
-        log_verbose("PDSE stream: restoring through IEBCOPY via unload data set %s", st->unload_dsn);
-    }
-    return 0;
-}
-
-static int process_pds_ckd_data(receive_state_t *st, const uint8_t *data, size_t len)
-{
-    if (st->po_alloc_pending && allocate_po_target(st, data, len) != 0) return -1;
-
-    if (st->use_iebcopy) {
-        if (fwrite(data, 1, len, st->unload_fp) != len) {
-            log_error("Failed writing unload record %zu: %s", st->records_restored + 1, strerror(errno));
-            st->error_code = RC_ERR_STREAM;
-            return -1;
-        }
-        st->records_restored++;
-        return 0;
-    }
-
     switch (st->pds_phase) {
     case PDS_PHASE_COPYR1:
         /* COPYR1 header (56 bytes, 00 CA 6D 0F ...) */
@@ -404,6 +435,134 @@ static int process_pds_ckd_data(receive_state_t *st, const uint8_t *data, size_t
     default: /* directory units and member data are one byte stream */
         return process_member_bytes(st, data, len);
     }
+}
+
+/* Create the unload data set the records of an IEBCOPY restore are collected in */
+static int start_iebcopy_unload(receive_state_t *st)
+{
+    dynalloc_temp_dsn(st->unload_dsn, sizeof(st->unload_dsn), "UNLD");
+    if (iebcopy_alloc_unload(st->unload_dsn, "UNLOAD", st->info.size_bytes) != 0) {
+        st->error_code = RC_ERR_ALLOC_TGT;
+        return -1;
+    }
+    st->unload_allocated = true;
+    st->unload_fp = fopen("DD:UNLOAD", "wb,type=record");
+    if (!st->unload_fp) {
+        log_error("Failed to open the unload data set '%s': %s", st->unload_dsn, strerror(errno));
+        st->error_code = RC_ERR_ALLOC_TGT;
+        return -1;
+    }
+    st->use_iebcopy = true;
+    return 0;
+}
+
+static int write_unload_record(receive_state_t *st, const uint8_t *data, size_t len)
+{
+    if (fwrite(data, 1, len, st->unload_fp) != len) {
+        log_error("Failed writing unload record %zu: %s", st->records_restored + 1, strerror(errno));
+        st->error_code = RC_ERR_STREAM;
+        return -1;
+    }
+    st->records_restored++;
+    return 0;
+}
+
+/* Allocate the PO target once COPYR1 tells whether the unload comes from a PDSE
+ * (first byte of COPYR1: X'01' data PDSE, X'10'/X'11' program objects; a PDS has
+ * X'00'). A data PDSE is written member by member; program libraries (and any
+ * PDSE when USSXMIT_IEBCOPY is set) go through IEBCOPY. */
+static int allocate_po_target(receive_state_t *st, const uint8_t *copyr1, size_t len)
+{
+    char msg[256];
+    char alloc_cmd[400];
+    bool pdse = len >= 4 && copyr1[1] == 0xCA && copyr1[2] == 0x6D && copyr1[3] == 0x0F &&
+                (copyr1[0] & 0x11) != 0;
+    bool native = pdse && copyr1[0] == 0x01 && (st->info.recfm & RECFM_U) != RECFM_U &&
+                  getenv("USSXMIT_IEBCOPY") == NULL;
+
+    snprintf(alloc_cmd, sizeof(alloc_cmd), "%s%s", st->po_alloc_cmd, pdse ? " dsntype(library)" : "");
+    log_verbose("Allocating target dataset: %s", alloc_cmd);
+    int rc = dynalloc_str(alloc_cmd, msg, sizeof(msg));
+    if (rc != 0) {
+        log_error("Failed allocating target dataset '%s': %s (rc=%d)", st->target_dsn, msg, rc);
+        st->error_code = RC_ERR_ALLOC_TGT;
+        return -1;
+    }
+    /* Members are allocated individually (PDS, native PDSE) or by IEBCOPY */
+    dynalloc_str("free fi(RCVOUT)", msg, sizeof(msg));
+    st->po_alloc_pending = false;
+
+    if (native) {
+        st->pdse_native = true;
+        log_verbose("Data PDSE stream: restoring member by member");
+    } else if (pdse) {
+        if (start_iebcopy_unload(st) != 0) return -1;
+        log_verbose("PDSE stream: restoring through IEBCOPY via unload data set %s", st->unload_dsn);
+    }
+    return 0;
+}
+
+/* Keep the records up to the end of the directory of a native PDSE restore */
+static int replay_append(receive_state_t *st, const uint8_t *data, size_t len)
+{
+    size_t need = st->replay_len + 4 + len;
+    if (need > st->replay_cap) {
+        size_t cap = st->replay_cap ? st->replay_cap : 65536;
+        while (cap < need) cap *= 2;
+        uint8_t *n = realloc(st->replay, cap);
+        if (!n) {
+            log_error("Out of memory buffering the PDSE directory");
+            st->error_code = RC_ERR_STREAM;
+            return -1;
+        }
+        st->replay = n;
+        st->replay_cap = cap;
+    }
+    uint8_t *q = st->replay + st->replay_len;
+    q[0] = (uint8_t)(len >> 24); q[1] = (uint8_t)(len >> 16); q[2] = (uint8_t)(len >> 8); q[3] = (uint8_t)len;
+    memcpy(q + 4, data, len);
+    st->replay_len = need;
+    return 0;
+}
+
+static void replay_free(receive_state_t *st)
+{
+    free(st->replay);
+    st->replay = NULL;
+    st->replay_len = st->replay_cap = 0;
+}
+
+/* The directory has aliases or user data that only IEBCOPY restores: move to the
+ * IEBCOPY path and feed it the records seen so far. */
+static int switch_to_iebcopy(receive_state_t *st)
+{
+    log_verbose("PDSE directory has aliases or user data: restoring through IEBCOPY");
+    if (start_iebcopy_unload(st) != 0) return -1;
+    st->pdse_native = false;
+    st->switch_pending = false;
+    for (size_t off = 0; off + 4 <= st->replay_len; ) {
+        const uint8_t *q = st->replay + off;
+        size_t n = ((size_t)q[0] << 24) | ((size_t)q[1] << 16) | ((size_t)q[2] << 8) | q[3];
+        if (write_unload_record(st, q + 4, n) != 0) return -1;
+        off += 4 + n;
+    }
+    replay_free(st);
+    return 0;
+}
+
+static int process_pds_ckd_data(receive_state_t *st, const uint8_t *data, size_t len)
+{
+    if (st->po_alloc_pending && allocate_po_target(st, data, len) != 0) return -1;
+
+    if (st->use_iebcopy) return write_unload_record(st, data, len);
+
+    if (st->pdse_native && st->pds_phase < PDS_PHASE_DATA && replay_append(st, data, len) != 0) return -1;
+
+    int rc = process_pds_record(st, data, len);
+    if (rc != 0) return rc;
+    if (st->switch_pending) return switch_to_iebcopy(st);
+    if (st->pds_phase >= PDS_PHASE_DATA) replay_free(st);
+    return 0;
 }
 
 static int receive_record_cb(bool is_control, const uint8_t *data, size_t len, void *user_data)
@@ -585,8 +744,13 @@ int do_receive(const ussxmit_opts_t *opts)
     if (state.is_pds && state.po_alloc_pending && state.error_code == 0) {
         allocate_po_target(&state, NULL, 0);    /* empty stream: create the empty PDS */
     }
+    replay_free(&state);
     if (state.is_pds) {
         close_current_member(&state);
+        if (state.pdse_native && state.error_code == 0 && state.members_restored != state.member_count) {
+            log_error("PDSE stream ended after %zu of %zu members", state.members_restored, state.member_count);
+            state.error_code = RC_ERR_STREAM;
+        }
     } else {
         if (state.out_fp) {
             fclose(state.out_fp);
@@ -626,8 +790,9 @@ int do_receive(const ussxmit_opts_t *opts)
         log_info("Successfully restored PDSE %s through IEBCOPY (%zu unload records)",
                  state.target_dsn, state.records_restored);
     } else if (state.is_pds) {
-        log_info("Successfully restored %zu members (%zu blocks) to PDS %s",
-                 state.members_restored, state.records_restored, state.target_dsn);
+        log_info("Successfully restored %zu members (%zu blocks) to %s %s",
+                 state.members_restored, state.records_restored,
+                 state.pdse_native ? "PDSE" : "PDS", state.target_dsn);
     } else {
         log_info("Successfully restored %zu records to dataset %s",
                  state.records_restored, state.target_dsn);
