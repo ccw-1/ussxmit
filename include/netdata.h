@@ -71,6 +71,7 @@ typedef struct {
     size_t      card_pos;
     size_t      total_records_written;
     size_t      total_bytes_written;
+    uint8_t     inmtype;        /* INMTYPE of the IEBCOPY INMR02: 0x80 data library, 0x40 program library */
 } netdata_writer_t;
 
 void netdata_writer_init(netdata_writer_t *w, FILE *out_fp);

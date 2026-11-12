@@ -12,7 +12,8 @@ On z/OS, dataset interchange has historically required interactive TSO sessions,
 
 ### Key Capabilities
 - **Single Unified Binary**: Invoked as `ussxmit <action> [options] [dataset-name]` with built-in symlink support (`xmit`, `receive`).
-- **Zero Temporary DASD Staging**: Operates 100% in-process using dynamic allocation (`BPXWDYN` via SVC 6) and native z/OS C record I/O (`type=record`), eliminating temporary scratch datasets.
+- **Zero Temporary DASD Staging**: Operates 100% in-process using dynamic allocation (`BPXWDYN` via SVC 6) and native z/OS C record I/O (`type=record`), eliminating temporary scratch datasets. Exception: PDSE (see below).
+- **Sequential, PDS and PDSE**: PDSE data libraries and program-object (load) libraries are supported in both directions. Their unload format is only handled by IEBCOPY, so `xmit` and `receive` run IEBCOPY through `tsocmd` with temporary data sets (an unload data set about the size of the stream, and three small ones).
 - **Full Standard XMIT / Netdata Compatibility**: Generates and decodes IBM standard Netdata card streams (`RECFM=FB`, `LRECL=80`, `INMR01`–`INMR06` control records and text units). Archives created by `ussxmit` can be restored by standard `TSO RECEIVE` and vice versa.
 - **Direct Dataset & Stream Inspection**: `ussxmit inspect` reads metadata (DSN, DSORG, RECFM, LRECL, BLKSIZE, directory blocks, origin node/user, timestamp) directly from MVS datasets, Unix files, or stdin pipes without restoring.
 - **Unix Pipeline Friendly**: Streams raw XMIT binary cards directly to `stdout` and consumes them from `stdin`, enabling direct composition with `gzip`, `ssh`, `nc`, `tar`, and `curl`.

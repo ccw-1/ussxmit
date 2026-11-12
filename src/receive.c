@@ -11,6 +11,7 @@
 #include "ussxmit.h"
 #include "netdata.h"
 #include "dynalloc.h"
+#include "iebcopy.h"
 #include "utils.h"
 
 #define MAX_RECV_MEMBERS 4096
@@ -71,6 +72,15 @@ typedef struct {
     FILE                 *out_mem_fp;
     bool                  mem_allocated;
     size_t                members_restored;
+
+    /* PDSE (and other COPYR1 flagged) streams are restored through IEBCOPY:
+     * the unload records go to a temporary sequential data set first. */
+    bool                  po_alloc_pending; /* target PO data set is allocated when COPYR1 shows its kind */
+    char                  po_alloc_cmd[320];
+    bool                  use_iebcopy;
+    char                  unload_dsn[64];
+    FILE                 *unload_fp;
+    bool                  unload_allocated;
 } receive_state_t;
 
 static void close_current_member(receive_state_t *st)
@@ -169,8 +179,9 @@ static int write_member_block(receive_state_t *st, const uint8_t *blk, size_t le
                 return -1;
             }
         } else {
-            log_warn("Received CKD block without active member in directory");
-            return 0;
+            log_error("Received CKD block without active member in directory");
+            st->error_code = RC_ERR_STREAM;
+            return -1;
         }
     }
 
@@ -307,8 +318,61 @@ static int process_member_bytes(receive_state_t *st, const uint8_t *p, size_t le
     return 0;
 }
 
+/* Allocate the PO target once COPYR1 tells whether the unload comes from a PDSE
+ * (first byte of COPYR1: X'01' PDSE, X'10' PDSE with program objects; a PDS has
+ * X'00'). A PDSE goes through IEBCOPY. */
+static int allocate_po_target(receive_state_t *st, const uint8_t *copyr1, size_t len)
+{
+    char msg[256];
+    char alloc_cmd[400];
+    bool pdse = len >= 4 && copyr1[1] == 0xCA && copyr1[2] == 0x6D && copyr1[3] == 0x0F &&
+                (copyr1[0] & 0x11) != 0;
+
+    snprintf(alloc_cmd, sizeof(alloc_cmd), "%s%s", st->po_alloc_cmd, pdse ? " dsntype(library)" : "");
+    log_verbose("Allocating target dataset: %s", alloc_cmd);
+    int rc = dynalloc_str(alloc_cmd, msg, sizeof(msg));
+    if (rc != 0) {
+        log_error("Failed allocating target dataset '%s': %s (rc=%d)", st->target_dsn, msg, rc);
+        st->error_code = RC_ERR_ALLOC_TGT;
+        return -1;
+    }
+    /* Members are allocated individually (PDS) or by IEBCOPY (PDSE) */
+    dynalloc_str("free fi(RCVOUT)", msg, sizeof(msg));
+    st->po_alloc_pending = false;
+
+    if (pdse) {
+        dynalloc_temp_dsn(st->unload_dsn, sizeof(st->unload_dsn), "UNLD");
+        if (iebcopy_alloc_unload(st->unload_dsn, "UNLOAD", st->info.size_bytes) != 0) {
+            st->error_code = RC_ERR_ALLOC_TGT;
+            return -1;
+        }
+        st->unload_allocated = true;
+        st->unload_fp = fopen("DD:UNLOAD", "wb,type=record");
+        if (!st->unload_fp) {
+            log_error("Failed to open the unload data set '%s': %s", st->unload_dsn, strerror(errno));
+            st->error_code = RC_ERR_ALLOC_TGT;
+            return -1;
+        }
+        st->use_iebcopy = true;
+        log_verbose("PDSE stream: restoring through IEBCOPY via unload data set %s", st->unload_dsn);
+    }
+    return 0;
+}
+
 static int process_pds_ckd_data(receive_state_t *st, const uint8_t *data, size_t len)
 {
+    if (st->po_alloc_pending && allocate_po_target(st, data, len) != 0) return -1;
+
+    if (st->use_iebcopy) {
+        if (fwrite(data, 1, len, st->unload_fp) != len) {
+            log_error("Failed writing unload record %zu: %s", st->records_restored + 1, strerror(errno));
+            st->error_code = RC_ERR_STREAM;
+            return -1;
+        }
+        st->records_restored++;
+        return 0;
+    }
+
     switch (st->pds_phase) {
     case PDS_PHASE_COPYR1:
         /* COPYR1 header (56 bytes, 00 CA 6D 0F ...) */
@@ -426,9 +490,21 @@ static int receive_record_cb(bool is_control, const uint8_t *data, size_t len, v
             }
 
             char alloc_cmd[320];
+            char lrecl_str[24] = "";
+            if ((st->info.recfm & RECFM_U) != RECFM_U) {
+                snprintf(lrecl_str, sizeof(lrecl_str), " lrecl(%u)", lrecl);   /* none for RECFM U */
+            }
             snprintf(alloc_cmd, sizeof(alloc_cmd),
-                     "alloc fi(RCVOUT) da('%s') new catalog %s%s recfm(%s) lrecl(%u) blksize(%u)",
-                     st->target_dsn, space_str, dir_str, recfm_str, lrecl, blksize);
+                     "alloc fi(RCVOUT) da('%s') new catalog %s%s recfm(%s)%s blksize(%u)",
+                     st->target_dsn, space_str, dir_str, recfm_str, lrecl_str, blksize);
+
+            if (st->is_pds) {
+                /* Defer: COPYR1 (first data record) tells PDS from PDSE */
+                snprintf(st->po_alloc_cmd, sizeof(st->po_alloc_cmd), "%s", alloc_cmd);
+                st->po_alloc_pending = true;
+                st->target_allocated = false;
+                return 0;
+            }
 
             log_verbose("Allocating target dataset: %s", alloc_cmd);
             int rc = dynalloc_str(alloc_cmd, msg, sizeof(msg));
@@ -439,19 +515,13 @@ static int receive_record_cb(bool is_control, const uint8_t *data, size_t len, v
             }
             st->target_allocated = true;
 
-            if (st->is_pds) {
-                /* For PDS, free the container DD since members will be allocated individually */
+            /* Sequential dataset: open the container for record writing */
+            st->out_fp = fopen("DD:RCVOUT", "wb,type=record");
+            if (!st->out_fp) {
+                log_error("Failed to open DD:RCVOUT for dataset '%s': %s", st->target_dsn, strerror(errno));
                 dynalloc_str("free fi(RCVOUT)", msg, sizeof(msg));
-                st->target_allocated = false;
-            } else {
-                /* For sequential dataset, open container for record writing */
-                st->out_fp = fopen("DD:RCVOUT", "wb,type=record");
-                if (!st->out_fp) {
-                    log_error("Failed to open DD:RCVOUT for dataset '%s': %s", st->target_dsn, strerror(errno));
-                    dynalloc_str("free fi(RCVOUT)", msg, sizeof(msg));
-                    st->error_code = RC_ERR_ALLOC_TGT;
-                    return -1;
-                }
+                st->error_code = RC_ERR_ALLOC_TGT;
+                return -1;
             }
         } else if (len >= 6 && memcmp(data, inmr06_eye, 6) == 0) {
             log_verbose("Processing INMR06 trailer (end of transmission)");
@@ -512,6 +582,9 @@ int do_receive(const ussxmit_opts_t *opts)
     }
 
     char msg[256];
+    if (state.is_pds && state.po_alloc_pending && state.error_code == 0) {
+        allocate_po_target(&state, NULL, 0);    /* empty stream: create the empty PDS */
+    }
     if (state.is_pds) {
         close_current_member(&state);
     } else {
@@ -523,11 +596,36 @@ int do_receive(const ussxmit_opts_t *opts)
         }
     }
 
+    if (state.unload_fp) {
+        fclose(state.unload_fp);
+        state.unload_fp = NULL;
+    }
+    if (state.unload_allocated) {
+        dynalloc_str("free fi(UNLOAD)", msg, sizeof(msg));
+    }
+    if (state.use_iebcopy && state.error_code == 0) {
+        static char iebcopy_log[16384];
+        int irc = iebcopy_copy(state.unload_dsn, state.target_dsn, iebcopy_log, sizeof(iebcopy_log));
+        if (irc < 0 || irc > 4) {
+            log_error("IEBCOPY failed with return code %d restoring %s", irc, state.target_dsn);
+            if (iebcopy_log[0]) fprintf(stderr, "%s", iebcopy_log);
+            state.error_code = RC_ERR_TSO;
+        } else if (iebcopy_log[0]) {
+            log_verbose("IEBCOPY messages:\n%s", iebcopy_log);
+        }
+    }
+    if (state.unload_allocated) {
+        dynalloc_delete_dsn(state.unload_dsn);
+    }
+
     if (state.error_code != 0) {
         return state.error_code;
     }
 
-    if (state.is_pds) {
+    if (state.use_iebcopy) {
+        log_info("Successfully restored PDSE %s through IEBCOPY (%zu unload records)",
+                 state.target_dsn, state.records_restored);
+    } else if (state.is_pds) {
         log_info("Successfully restored %zu members (%zu blocks) to PDS %s",
                  state.members_restored, state.records_restored, state.target_dsn);
     } else {

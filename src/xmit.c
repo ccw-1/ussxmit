@@ -81,6 +81,7 @@ int do_xmit(const ussxmit_opts_t *opts)
     if (dsorg == DSORG_PO) {
         fclose(fp);
         dynalloc_str("free fi(XMITIN)", msg, sizeof(msg));
+        if (info.__dsorgPDSE) return xmit_pdse_stream(opts, src_dsn, &writer);
         return xmit_pds_stream(opts, src_dsn, dsorg, recfm, lrecl, blksize, &writer);
     }
 

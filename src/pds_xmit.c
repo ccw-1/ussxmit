@@ -12,6 +12,7 @@
 #include "netdata.h"
 #include "pds_xmit.h"
 #include "dynalloc.h"
+#include "iebcopy.h"
 #include "utils.h"
 
 #define MAX_MEMBERS 4096
@@ -515,4 +516,112 @@ int xmit_pds_stream(const ussxmit_opts_t *opts, const char *src_dsn,
     free(members);
     free(dir_blocks);
     return RC_SUCCESS;
+}
+
+/* PDSE (data library or program library): the physical layout is not a PDS
+ * track image, so the unload is made by IEBCOPY itself. It copies the PDSE to
+ * a temporary unload data set (RECFM VS, 32756/3120) and the records of that
+ * data set are the data records of the stream, as in TSO TRANSMIT. */
+int xmit_pdse_stream(const ussxmit_opts_t *opts, const char *src_dsn, netdata_writer_t *writer)
+{
+    (void)opts;
+    char msg[256];
+    char cmd[320];
+    char unload_dsn[64];
+    static char iebcopy_log[16384];
+    int result = RC_ERR_STREAM;
+
+    log_verbose("Starting PDSE unload through IEBCOPY for: %s", src_dsn);
+
+    dynalloc_temp_dsn(unload_dsn, sizeof(unload_dsn), "XMUNL");
+    if (iebcopy_alloc_unload(unload_dsn, "UNLOAD", 0) != 0) return RC_ERR_ALLOC_SRC;
+
+    /* touch the new data set so that it is formatted, then release the DD */
+    FILE *ft = fopen("DD:UNLOAD", "wb,type=record");
+    if (ft) fclose(ft);
+    dynalloc_str("free fi(UNLOAD)", msg, sizeof(msg));
+    if (!ft) {
+        log_error("Cannot open unload data set '%s': %s", unload_dsn, strerror(errno));
+        dynalloc_delete_dsn(unload_dsn);
+        return RC_ERR_ALLOC_SRC;
+    }
+
+    int irc = iebcopy_copy(src_dsn, unload_dsn, iebcopy_log, sizeof(iebcopy_log));
+    if (irc < 0 || irc > 4) {
+        log_error("IEBCOPY unload of '%s' failed (rc=%d)", src_dsn, irc);
+        if (iebcopy_log[0]) fprintf(stderr, "%s", iebcopy_log);
+        dynalloc_delete_dsn(unload_dsn);
+        return RC_ERR_TSO;
+    }
+    if (iebcopy_log[0]) log_verbose("IEBCOPY messages:\n%s", iebcopy_log);
+
+    snprintf(cmd, sizeof(cmd), "alloc fi(UNLOAD) da('%s') shr", unload_dsn);
+    if (dynalloc_str(cmd, msg, sizeof(msg)) != 0) {
+        log_error("Failed to allocate unload data set '%s': %s", unload_dsn, msg);
+        dynalloc_delete_dsn(unload_dsn);
+        return RC_ERR_ALLOC_SRC;
+    }
+    FILE *fu = fopen("DD:UNLOAD", "rb,type=record");
+    uint8_t *rec = malloc(IEBCOPY_UNLOAD_LRECL + 16);
+    if (!fu || !rec) {
+        log_error("Cannot open unload data set '%s': %s", unload_dsn, strerror(errno));
+        if (fu) fclose(fu);
+        free(rec);
+        dynalloc_str("free fi(UNLOAD)", msg, sizeof(msg));
+        dynalloc_delete_dsn(unload_dsn);
+        return RC_ERR_ALLOC_SRC;
+    }
+
+    /* Pass 1: COPYR1 (attributes) and total size */
+    size_t n = fread(rec, 1, IEBCOPY_UNLOAD_LRECL, fu);
+    if (n < 56) {
+        log_error("IEBCOPY unload of '%s' is empty or truncated", src_dsn);
+        goto done;
+    }
+    uint8_t  c1_flags = rec[0];
+    uint16_t c1_dsorg = (uint16_t)((rec[4] << 8) | rec[5]);
+    uint32_t c1_blksize = (uint32_t)((rec[6] << 8) | rec[7]);
+    uint32_t c1_lrecl = (uint32_t)((rec[8] << 8) | rec[9]);
+    uint8_t  c1_recfm = rec[10];
+    uint64_t size_bytes = n;
+    while ((n = fread(rec, 1, IEBCOPY_UNLOAD_LRECL, fu)) > 0) size_bytes += n;
+    rewind(fu);
+    log_verbose("PDSE unload: %llu bytes, COPYR1 flags 0x%02X, DSORG 0x%04X, RECFM 0x%02X, LRECL %u, BLKSIZE %u",
+                (unsigned long long)size_bytes, c1_flags, c1_dsorg, c1_recfm, c1_lrecl, c1_blksize);
+
+    writer->inmtype = (c1_flags & 0x10) ? 0x40 : 0x80;
+    if (netdata_writer_emit_inmr01(writer, "POK", get_current_hlq()) != 0 ||
+        netdata_writer_emit_inmr02_ex(writer, "IEBCOPY", src_dsn, DSORG_PO, c1_recfm, 0x00, c1_lrecl,
+                                      c1_blksize, size_bytes, 1) != 0 ||
+        netdata_writer_emit_inmr02_ex(writer, "INMCOPY", NULL, DSORG_PS, 0x48, 0x02, IEBCOPY_UNLOAD_LRECL,
+                                      IEBCOPY_UNLOAD_BLKSIZE, size_bytes, 0) != 0 ||
+        netdata_writer_emit_inmr03(writer, DSORG_PS, 0x01, 80, size_bytes) != 0) {
+        log_error("Failed to emit INMR01/INMR02/INMR03 records");
+        goto done;
+    }
+
+    /* Pass 2: every unload record is a data record of the stream */
+    size_t nrec = 0;
+    while ((n = fread(rec, 1, IEBCOPY_UNLOAD_LRECL, fu)) > 0) {
+        if (netdata_writer_emit_data(writer, rec, n) != 0) {
+            log_error("Failed writing data segment for record %zu", nrec + 1);
+            goto done;
+        }
+        nrec++;
+    }
+    if (netdata_writer_emit_inmr06(writer) != 0) {
+        log_error("Failed to emit INMR06 trailer record");
+        goto done;
+    }
+    netdata_writer_flush(writer);
+    log_info("Successfully unloaded PDSE %s (%zu records, %llu bytes)", src_dsn, nrec,
+             (unsigned long long)size_bytes);
+    result = RC_SUCCESS;
+
+done:
+    fclose(fu);
+    free(rec);
+    dynalloc_str("free fi(UNLOAD)", msg, sizeof(msg));
+    dynalloc_delete_dsn(unload_dsn);
+    return result;
 }

@@ -40,6 +40,15 @@ echo "Test 7: Verify restored PDS dataset via re-xmit pipeline"
 $BIN xmit "CCW.TESTPDS.INTTEST" | $BIN inspect | grep "Dataset Name : CCW.TESTPDS.INTTEST"
 $BIN xmit "CCW.TESTPDS.INTTEST" | $BIN inspect | grep "Organization : PO (Partitioned)"
 
+# 8. PDSE (data library, via IEBCOPY): xmit -> receive -> same members
+echo "Test 8: Streaming PDSE pipeline: xmit -> receive"
+$BIN xmit "CCW.TESTPDSE" | $BIN receive -f "CCW.TESTPDSE.INTTEST"
+for m in MEM1 MEM2 MEM3; do
+    a=$(cat "//'CCW.TESTPDSE($m)'" | cksum)
+    b=$(cat "//'CCW.TESTPDSE.INTTEST($m)'" | cksum)
+    [ "$a" = "$b" ] || { echo "PDSE member $m differs"; exit 1; }
+done
+
 echo ""
 echo "=================================================="
 echo " All Integration Tests Passed Successfully!"

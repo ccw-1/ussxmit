@@ -15,6 +15,7 @@ SRCS = $(SRCDIR)/main.c \
        $(SRCDIR)/inspect.c \
        $(SRCDIR)/netdata.c \
        $(SRCDIR)/dynalloc.c \
+       $(SRCDIR)/iebcopy.c \
        $(SRCDIR)/utils.c
 
 OBJS = $(patsubst $(SRCDIR)/%.c, $(OBJDIR)/%.o, $(SRCS))

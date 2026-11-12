@@ -101,6 +101,7 @@ void netdata_writer_init(netdata_writer_t *w, FILE *out_fp)
     w->card_pos = 0;
     w->total_records_written = 0;
     w->total_bytes_written = 0;
+    w->inmtype = 0x00;
     memset(w->card_buf, 0x40, sizeof(w->card_buf));
 }
 
@@ -309,12 +310,13 @@ int netdata_writer_emit_inmr02_ex(netdata_writer_t *w, const char *utility, cons
     buf[off++] = recfm;
     buf[off++] = recfm2;
 
-    /* TU 0x8012: INMTYPE (1 byte, 0 = data library) accompanies IEBCOPY */
+    /* TU 0x8012: INMTYPE (1 byte) accompanies IEBCOPY: 0 for a PDS, 0x80 for a
+     * PDSE data library, 0x40 for a program library */
     if (strcmp(utility, "IEBCOPY") == 0) {
         write_u16_be(buf + off, 0x8012); off += 2;
         write_u16_be(buf + off, 1);      off += 2;
         write_u16_be(buf + off, 1);      off += 2;
-        buf[off++] = 0x00;
+        buf[off++] = w->inmtype;
     }
 
     /* TU 0x0002: INMDSNAM (split qualifiers); omitted when dsn is NULL */
